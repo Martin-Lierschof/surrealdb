@@ -32,7 +32,7 @@ use crate::cnf::MAX_ORDER_LIMIT_PRIORITY_QUEUE_SIZE;
 use crate::err::Error;
 use crate::exec::expression_registry::{ComputePoint, ExpressionRegistry, resolve_order_by_alias};
 use crate::exec::field_path::FieldPath;
-use crate::exec::index::access_path::{AccessPath, select_access_path};
+use crate::exec::index::access_path::{AccessPath, BTreeAccess, select_access_path};
 use crate::exec::index::analysis::IndexAnalyzer;
 #[cfg(all(storage, not(target_family = "wasm")))]
 use crate::exec::operators::ExternalSort;
@@ -266,6 +266,20 @@ impl<'ctx> Planner<'ctx> {
 		// If we couldn't convert all fields, can't eliminate
 		if required.len() != order_list.len() {
 			return false;
+		}
+
+		// Strip leading ORDER BY fields that reference constant
+		// (equality-pinned) columns in the input.  These columns have a
+		// single value, so any direction trivially satisfies the ordering.
+		let constant_fields = input.constant_output_fields();
+		let required: Vec<SortProperty> = required
+			.into_iter()
+			.skip_while(|prop| constant_fields.iter().any(|cf| *cf == prop.path))
+			.collect();
+
+		// If all required fields were constant, the ordering is trivially satisfied.
+		if required.is_empty() {
+			return true;
 		}
 
 		// Check if the input's output ordering satisfies the requirement
@@ -1773,6 +1787,26 @@ impl<'ctx> Planner<'ctx> {
 						// operators at plan time. The residual WHERE
 						// predicate is handled by a Filter above
 						// (filter_action = UseOriginal).
+						//
+						// When ORDER BY is on `id` and every sub-path is
+						// an equality B-tree scan, enable merge-sort by
+						// record ID.  Each equality scan already produces
+						// records in record-ID order, so a k-way merge
+						// yields globally sorted output — the Sort
+						// operator can be eliminated and Limit terminates
+						// the scan early.
+						let merge_dir = detect_order_by_id_only(order).filter(|_| {
+							paths.iter().all(|p| {
+								matches!(
+									p,
+									AccessPath::BTreeScan {
+										access: BTreeAccess::Equality(_),
+										..
+									}
+								)
+							})
+						});
+
 						let mut sub_operators: Vec<Arc<dyn ExecOperator>> =
 							Vec::with_capacity(paths.len());
 						for path in paths {
@@ -1855,6 +1889,9 @@ impl<'ctx> Planner<'ctx> {
 						// pipeline handles Filter, Sort, and Limit.
 						let mut union_scan =
 							UnionIndexScan::new(table, sub_operators, needed_fields);
+						if let Some(dir) = merge_dir {
+							union_scan = union_scan.with_merge_by_id(dir);
+						}
 						if let Some(ref tc) = table_ctx {
 							union_scan = union_scan.with_resolved(tc.clone());
 						}
@@ -2212,33 +2249,87 @@ fn adjust_direction_for_order(
 		return (path, default_direction);
 	};
 
-	// Check the first ORDER BY field against the index's first column
-	let Some(first_order) = order_list.0.first() else {
+	let ix_def = index_ref.definition();
+
+	// Collect equality-pinned column paths so we can skip ORDER BY fields
+	// that reference them (those columns have a single constant value,
+	// so any direction trivially satisfies the requirement).
+	let equality_col_paths: Vec<FieldPath> = match access {
+		BTreeAccess::Compound {
+			prefix,
+			..
+		} => ix_def
+			.cols
+			.iter()
+			.take(prefix.len())
+			.filter_map(|idiom| FieldPath::try_from(idiom).ok())
+			.collect(),
+		BTreeAccess::Equality(_) => {
+			ix_def.cols.iter().filter_map(|idiom| FieldPath::try_from(idiom).ok()).collect()
+		}
+		_ => vec![],
+	};
+
+	// Skip leading ORDER BY fields that match equality-pinned columns.
+	let mut order_idx = 0;
+	for field in order_list.0.iter() {
+		if let Ok(fp) = FieldPath::try_from(&field.value) {
+			if equality_col_paths.iter().any(|ep| *ep == fp) {
+				order_idx += 1;
+				continue;
+			}
+		}
+		break;
+	}
+
+	// Get the first non-constant ORDER BY field
+	let Some(first_order) = order_list.0.get(order_idx) else {
+		// All ORDER BY fields are constant — direction doesn't matter,
+		// keep the default.
 		return (path, default_direction);
 	};
 
-	let ix_def = index_ref.definition();
+	let Ok(order_path) = FieldPath::try_from(&first_order.value) else {
+		return (path, default_direction);
+	};
 
 	// Determine which index column to match against.
-	// For compound access with an equality prefix, the ORDER BY field should
-	// match the column immediately after the prefix (since the prefix columns
-	// all have equal values and don't define ordering).
+	// For compound access with an equality prefix, match the column
+	// immediately after the prefix.  For Equality access on a
+	// single-column index, all index columns are skipped.
 	let target_col_index = match access {
 		BTreeAccess::Compound {
 			prefix,
 			..
 		} => prefix.len(),
+		BTreeAccess::Equality(_) => ix_def.cols.len(),
 		_ => 0,
 	};
+
+	// If all index columns are equality-pinned, the effective ordering
+	// is by record ID.  Check if the ORDER BY field is `id`.
+	if target_col_index >= ix_def.cols.len() {
+		// All columns are equality-pinned.  Match `ORDER BY id`.
+		if order_path == FieldPath::field("id") {
+			let new_direction = if first_order.direction {
+				ScanDirection::Forward // ASC
+			} else {
+				ScanDirection::Backward // DESC
+			};
+			let new_path = AccessPath::BTreeScan {
+				index_ref: index_ref.clone(),
+				access: access.clone(),
+				direction: new_direction,
+			};
+			return (new_path, new_direction);
+		}
+		return (path, default_direction);
+	}
 
 	let Some(target_col) = ix_def.cols.get(target_col_index) else {
 		return (path, default_direction);
 	};
 
-	// Convert both to FieldPath for comparison
-	let Ok(order_path) = FieldPath::try_from(&first_order.value) else {
-		return (path, default_direction);
-	};
 	let Ok(col_path) = FieldPath::try_from(target_col) else {
 		return (path, default_direction);
 	};
@@ -2286,5 +2377,30 @@ fn collect_field_names(fields: &Fields) -> Vec<String> {
 			}
 			names
 		}
+	}
+}
+
+/// Check whether the ORDER BY clause is exactly `ORDER BY id ASC` or
+/// `ORDER BY id DESC` with no additional columns.
+///
+/// Returns `Some(SortDirection)` when the condition is met, allowing
+/// callers to enable optimisations that rely on record-ID ordering
+/// (e.g. merge-sort in `UnionIndexScan`).
+fn detect_order_by_id_only(order: Option<&crate::expr::order::Ordering>) -> Option<SortDirection> {
+	use crate::expr::order::Ordering;
+	if let Some(Ordering::Order(order_list)) = order
+		&& order_list.len() == 1
+		&& let Some(first) = order_list.0.first()
+		&& first.value.is_id()
+		&& !first.collate
+		&& !first.numeric
+	{
+		Some(if first.direction {
+			SortDirection::Asc
+		} else {
+			SortDirection::Desc
+		})
+	} else {
+		None
 	}
 }

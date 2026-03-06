@@ -200,11 +200,16 @@ impl ExecOperator for IndexScan {
 		// non-equality column. This allows `satisfies()` to match ORDER BY
 		// on the column after the prefix (e.g. `ORDER BY modified DESC`
 		// with `idx(IsVisible, modified)` and `WHERE IsVisible = true`).
+		//
+		// For single-column Equality access (`WHERE col = val`), ALL index
+		// columns are constant, so we skip them all.  The effective ordering
+		// is then just the implicit record-id tail for non-unique indexes.
 		let skip_cols = match &self.access {
 			BTreeAccess::Compound {
 				prefix,
 				..
 			} => prefix.len(),
+			BTreeAccess::Equality(_) => self.index_ref.definition().cols.len(),
 			_ => 0,
 		};
 
@@ -228,19 +233,52 @@ impl ExecOperator for IndexScan {
 		// sorted by record ID after the declared index columns.  Expose
 		// this so that ORDER BY (col DESC, id DESC) is recognised as
 		// satisfied by a backward index scan.
-		if !self.index_ref.is_unique() && !cols.is_empty() {
-			cols.push(SortProperty {
-				path: crate::exec::field_path::FieldPath::field("id"),
-				direction: dir,
-				collate: false,
-				numeric: false,
-			});
+		//
+		// When all index columns are skipped (e.g., single-column Equality),
+		// the effective ordering is *only* by record ID.  We still append
+		// the `id` property so `ORDER BY id` can be satisfied.
+		if !self.index_ref.is_unique() {
+			// Only append if the index actually has columns (guards against
+			// degenerate case of zero-column index definitions).
+			if !ix_def.cols.is_empty() {
+				cols.push(SortProperty {
+					path: crate::exec::field_path::FieldPath::field("id"),
+					direction: dir,
+					collate: false,
+					numeric: false,
+				});
+			}
 		}
 
 		if cols.is_empty() {
 			crate::exec::OutputOrdering::Unordered
 		} else {
 			crate::exec::OutputOrdering::Sorted(cols)
+		}
+	}
+
+	fn constant_output_fields(&self) -> Vec<crate::exec::field_path::FieldPath> {
+		use crate::exec::index::access_path::BTreeAccess;
+
+		let ix_def = self.index_ref.definition();
+		match &self.access {
+			// All index columns have the same value for Equality scans
+			BTreeAccess::Equality(_) => ix_def
+				.cols
+				.iter()
+				.filter_map(|idiom| crate::exec::field_path::FieldPath::try_from(idiom).ok())
+				.collect(),
+			// Compound prefix columns are all equality-pinned
+			BTreeAccess::Compound {
+				prefix,
+				..
+			} => ix_def
+				.cols
+				.iter()
+				.take(prefix.len())
+				.filter_map(|idiom| crate::exec::field_path::FieldPath::try_from(idiom).ok())
+				.collect(),
+			_ => vec![],
 		}
 	}
 
@@ -373,7 +411,8 @@ impl ExecOperator for IndexScan {
 
 				// Non-unique equality - multiple records possible
 				(BTreeAccess::Equality(value), false) => {
-					let mut iter = IndexEqualIterator::new(ns_id, db_id, ix, value)
+					let reverse = matches!(direction, ScanDirection::Backward);
+					let mut iter = IndexEqualIterator::with_direction(ns_id, db_id, ix, value, reverse)
 						.context("Failed to create iterator")?;
 
 					loop {

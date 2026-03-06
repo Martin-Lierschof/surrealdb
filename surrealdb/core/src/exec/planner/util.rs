@@ -1035,6 +1035,11 @@ pub(super) fn order_is_scan_compatible(order: &Option<crate::expr::order::Orderi
 /// For compound access with an equality prefix, the prefix columns all have
 /// the same value and do not define ordering. They are skipped so that the
 /// effective ordering starts from the first non-equality column.
+///
+/// For single-column Equality access (`WHERE col = val`), ALL index columns
+/// are constant, so they are all skipped.  Leading ORDER BY fields that
+/// reference constant (equality-pinned) columns are also stripped from the
+/// requirement because any direction trivially matches a single-valued column.
 pub(super) fn index_covers_ordering(
 	index_ref: &crate::exec::index::access_path::IndexRef,
 	access: &crate::exec::index::access_path::BTreeAccess,
@@ -1074,21 +1079,45 @@ pub(super) fn index_covers_ordering(
 		return false;
 	}
 
-	// For compound access with equality prefix, skip the prefix columns
-	let skip_cols = match access {
+	// Determine which index columns are equality-pinned (constant value).
+	let ix_def = index_ref.definition();
+	let (skip_cols, equality_field_paths) = match access {
 		BTreeAccess::Compound {
 			prefix,
 			..
-		} => prefix.len(),
-		_ => 0,
+		} => {
+			let paths: Vec<_> = ix_def
+				.cols
+				.iter()
+				.take(prefix.len())
+				.filter_map(|idiom| crate::exec::field_path::FieldPath::try_from(idiom).ok())
+				.collect();
+			(prefix.len(), paths)
+		}
+		BTreeAccess::Equality(_) => {
+			let paths: Vec<_> = ix_def
+				.cols
+				.iter()
+				.filter_map(|idiom| crate::exec::field_path::FieldPath::try_from(idiom).ok())
+				.collect();
+			(ix_def.cols.len(), paths)
+		}
+		_ => (0, vec![]),
 	};
+
+	// Strip leading ORDER BY fields that reference equality-pinned columns.
+	// These columns have a single constant value, so any direction trivially
+	// satisfies the ordering requirement for them.
+	let required: Vec<SortProperty> = required
+		.into_iter()
+		.skip_while(|prop| equality_field_paths.iter().any(|ef| *ef == prop.path))
+		.collect();
 
 	// Build the index ordering (same as IndexScan::output_ordering())
 	let dir = match direction {
 		crate::idx::planner::ScanDirection::Forward => SortDirection::Asc,
 		crate::idx::planner::ScanDirection::Backward => SortDirection::Desc,
 	};
-	let ix_def = index_ref.definition();
 	let mut cols: Vec<SortProperty> = ix_def
 		.cols
 		.iter()
@@ -1108,13 +1137,22 @@ pub(super) fn index_covers_ordering(
 	// ID, so we append an `id` property to the effective ordering.  This
 	// allows `ORDER BY col DESC, id DESC` to be satisfied by a backward
 	// compound index scan.
-	if !index_ref.is_unique() && !cols.is_empty() {
+	//
+	// When all index columns are skipped (Equality), the ordering is
+	// *only* by record ID — we still append it.
+	if !index_ref.is_unique() && !ix_def.cols.is_empty() {
 		cols.push(SortProperty {
 			path: crate::exec::field_path::FieldPath::field("id"),
 			direction: dir,
 			collate: false,
 			numeric: false,
 		});
+	}
+
+	// If all required fields were stripped (all constant), the ordering
+	// is trivially satisfied.
+	if required.is_empty() {
+		return true;
 	}
 
 	if cols.is_empty() {

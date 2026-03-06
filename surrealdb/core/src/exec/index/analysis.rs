@@ -1052,18 +1052,78 @@ impl<'a> IndexAnalyzer<'a> {
 		// scan naturally produces records in ORDER BY order. Mark it as
 		// covering ORDER BY so that the planner can push LIMIT down and
 		// eliminate the Sort operator.
+		//
+		// We also handle the case where leading ORDER BY fields match
+		// equality-prefix columns and can be skipped (they are constant).
 		for candidate in candidates.iter_mut() {
-			if let BTreeAccess::Compound {
-				prefix,
-				..
-			} = &candidate.access
-			{
-				let ix_def = candidate.index_ref.definition();
-				if let Some(next_col) = ix_def.cols.get(prefix.len())
-					&& idiom_matches(idiom, next_col)
-				{
-					candidate.covers_order = true;
+			match &candidate.access {
+				BTreeAccess::Compound {
+					prefix,
+					..
+				} => {
+					let ix_def = candidate.index_ref.definition();
+
+					// Collect equality-prefix column idioms
+					let prefix_cols: Vec<&Idiom> =
+						ix_def.cols.iter().take(prefix.len()).collect();
+
+					// Skip leading ORDER BY fields that match prefix columns
+					let mut order_idx = 0;
+					for field in order_list.0.iter() {
+						if prefix_cols.iter().any(|col| idiom_matches(&field.value, col)) {
+							order_idx += 1;
+						} else {
+							break;
+						}
+					}
+
+					// Check if the next ORDER BY field matches the column
+					// after the prefix (or if it's `id` when all index
+					// columns are exhausted by the prefix)
+					if let Some(next_order) = order_list.0.get(order_idx) {
+						if let Some(next_col) = ix_def.cols.get(prefix.len()) {
+							if idiom_matches(&next_order.value, next_col) {
+								candidate.covers_order = true;
+							}
+						} else {
+							// All index columns are in the prefix — check for ORDER BY id
+							if next_order.value.is_id() {
+								candidate.covers_order = true;
+							}
+						}
+					} else {
+						// All ORDER BY fields matched prefix columns (all constant) —
+						// ordering is trivially satisfied
+						candidate.covers_order = true;
+					}
 				}
+				BTreeAccess::Equality(_) => {
+					// For single-column equality, the index column is constant.
+					// Skip ORDER BY fields matching the equality column, then
+					// check if the next field is `id` (the non-unique BTree
+					// tail key).
+					let ix_def = candidate.index_ref.definition();
+					let eq_cols: Vec<&Idiom> = ix_def.cols.iter().collect();
+
+					let mut order_idx = 0;
+					for field in order_list.0.iter() {
+						if eq_cols.iter().any(|col| idiom_matches(&field.value, col)) {
+							order_idx += 1;
+						} else {
+							break;
+						}
+					}
+
+					if let Some(next_order) = order_list.0.get(order_idx) {
+						if next_order.value.is_id() {
+							candidate.covers_order = true;
+						}
+					} else {
+						// All ORDER BY fields matched equality columns
+						candidate.covers_order = true;
+					}
+				}
+				_ => {}
 			}
 		}
 
@@ -1086,7 +1146,21 @@ impl<'a> IndexAnalyzer<'a> {
 				// Mark existing candidate as covering order, or add new one
 				let existing = candidates.iter_mut().find(|c| c.index_ref == index_ref);
 				if let Some(candidate) = existing {
-					candidate.covers_order = true;
+					// Only set covers_order here for candidates that were NOT
+					// already analyzed in the first loop (Compound/Equality).
+					// Those candidates have precise covers_order logic that
+					// accounts for multi-field ORDER BY; blindly overriding
+					// would incorrectly mark e.g. a single-column equality
+					// index as covering ORDER BY when it only matches the
+					// first ORDER BY field but not subsequent ones.
+					match &candidate.access {
+						BTreeAccess::Compound { .. } | BTreeAccess::Equality(_) => {
+							// Already analyzed above — don't override
+						}
+						_ => {
+							candidate.covers_order = true;
+						}
+					}
 				} else {
 					// Create a full-range scan candidate that covers order
 					let candidate = IndexCandidate {

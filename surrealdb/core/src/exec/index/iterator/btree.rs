@@ -20,21 +20,37 @@ const INDEX_BATCH_SIZE: u32 = 1000;
 ///
 /// Scans all records matching a specific key value.
 pub struct IndexEqualIterator {
-	/// Current scan position (begin key)
+	/// Current scan position (begin key for forward, end key for reverse)
 	beg: Vec<u8>,
 	/// End key (exclusive)
 	end: Vec<u8>,
+	/// Whether to scan in reverse (highest to lowest key order)
+	reverse: bool,
 	/// Whether iteration is complete
 	done: bool,
 }
 
 impl IndexEqualIterator {
-	/// Create a new equality iterator.
+	/// Create a new equality iterator (always forward).
 	pub fn new(
 		ns: NamespaceId,
 		db: DatabaseId,
 		ix: &IndexDefinition,
 		value: &Value,
+	) -> Result<Self> {
+		Self::with_direction(ns, db, ix, value, false)
+	}
+
+	/// Create a new equality iterator with explicit direction.
+	///
+	/// When `reverse` is true, the iterator uses `tx.scanr()` to return
+	/// records in descending key order (highest to lowest record ID).
+	pub fn with_direction(
+		ns: NamespaceId,
+		db: DatabaseId,
+		ix: &IndexDefinition,
+		value: &Value,
+		reverse: bool,
 	) -> Result<Self> {
 		let array = Array::from(vec![value.clone()]);
 		let beg = Index::prefix_ids_beg(ns, db, &ix.table_name, ix.index_id, &array)?;
@@ -42,6 +58,7 @@ impl IndexEqualIterator {
 		Ok(Self {
 			beg,
 			end,
+			reverse,
 			done: false,
 		})
 	}
@@ -52,6 +69,15 @@ impl IndexEqualIterator {
 			return Ok(Vec::new());
 		}
 
+		if self.reverse {
+			self.next_batch_reverse(tx).await
+		} else {
+			self.next_batch_forward(tx).await
+		}
+	}
+
+	/// Forward scan: iterate from beg to end in ascending key order.
+	async fn next_batch_forward(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		let res = tx.scan(self.beg.clone()..self.end.clone(), INDEX_BATCH_SIZE, 0, None).await?;
 
 		if res.is_empty() {
@@ -63,6 +89,31 @@ impl IndexEqualIterator {
 		if let Some((key, _)) = res.last() {
 			self.beg.clone_from(key);
 			self.beg.push(0x00);
+		}
+
+		// Decode record IDs from values
+		let mut records = Vec::with_capacity(res.len());
+		for (_, val) in res {
+			let rid: RecordId = revision::from_slice(&val)?;
+			records.push(rid);
+		}
+
+		Ok(records)
+	}
+
+	/// Reverse scan: iterate from end to beg in descending key order.
+	async fn next_batch_reverse(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
+		let res = tx.scanr(self.beg.clone()..self.end.clone(), INDEX_BATCH_SIZE, 0, None).await?;
+
+		if res.is_empty() {
+			self.done = true;
+			return Ok(Vec::new());
+		}
+
+		// scanr returns [highest_key, ..., lowest_key].
+		// Update end key for next batch to the lowest key (last in result).
+		if let Some((key, _)) = res.last() {
+			self.end.clone_from(key);
 		}
 
 		// Decode record IDs from values
