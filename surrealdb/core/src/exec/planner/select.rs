@@ -1646,7 +1646,9 @@ impl<'ctx> Planner<'ctx> {
 						let push = scan_limit.is_some()
 							&& match order {
 								None => true,
-								Some(ord) => index_covers_ordering(&index_ref, &access, direction, ord),
+								Some(ord) => {
+									index_covers_ordering(&index_ref, &access, direction, ord)
+								}
 							};
 						let (idx_limit, idx_start, limit_pushed) = if push {
 							(scan_limit.clone(), scan_start.clone(), true)
