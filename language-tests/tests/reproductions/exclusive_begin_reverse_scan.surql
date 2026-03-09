@@ -1,11 +1,11 @@
 /**
 [test]
-reason = "Regression: reverse scans with exclusive lower bound must not include the boundary value.
+reason = """Regression: reverse scans with exclusive lower bound must not include the boundary value.
 The first-batch boundary filter only checked the exclusive end boundary (check_exclusive_end),
 but had no equivalent protection for an exclusive begin boundary when scanning backward.
-Given WHERE v > 5 ORDER BY v DESC, the lower bound is exclusive (> 5). 
-Reverse scans keep beg fixed while moving end downward between batches, 
-so the lowest key in the range can eventually be emitted even when it is the excluded lower boundary."
+Given WHERE v > 5 ORDER BY v DESC, the lower bound is exclusive (> 5).
+Reverse scans keep beg fixed while moving end downward between batches,
+so the lowest key in the range can eventually be emitted even when it is the excluded lower boundary."""
 
 [[test.results]]
 value = "'OK'"
