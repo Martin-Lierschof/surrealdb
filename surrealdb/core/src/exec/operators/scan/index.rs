@@ -13,9 +13,9 @@ use super::pipeline::eval_limit_expr;
 use super::resolved::ResolvedTableContext;
 use crate::err::Error;
 use crate::exec::index::access_path::{BTreeAccess, IndexRef};
+use crate::exec::index::iterator::btree::{CompoundEqualIterator, CompoundRangeForwardIterator};
 use crate::exec::index::iterator::{
-	CompoundEqualIterator, CompoundRangeIterator, IndexEqualIterator, IndexRangeIterator,
-	UniqueEqualIterator, UniqueRangeIterator,
+	IndexEqualIterator, IndexRangeIterator, UniqueEqualIterator, UniqueRangeIterator,
 };
 use crate::exec::permission::{
 	PhysicalPermission, convert_permission_to_physical, should_check_perms,
@@ -411,14 +411,13 @@ impl ExecOperator for IndexScan {
 				// explicit `loop` blocks rather than abstracting over the
 				// iterator type because `async_stream` closures cannot
 				// easily hold trait objects or generics.
-				(BTreeAccess::Range { from, to }, true) => {
-					let reverse = matches!(direction, ScanDirection::Backward);
-					let mut iter = UniqueRangeIterator::with_direction(ns_id, db_id, ix, from.as_ref(), to.as_ref(), reverse)
-						.context("Failed to create iterator")?;
+			 (BTreeAccess::Range { from, to }, true) => {
+					let mut iter = UniqueRangeIterator::new(ns_id, db_id, ix, from.as_ref(), to.as_ref(), direction).context("Failed to create iterator")?;
+
 					loop {
 						if ctx.cancellation().is_cancelled() {
 							Err(ControlFlow::Err(anyhow::anyhow!(
-								crate::err::Error::QueryCancelled
+								Error::QueryCancelled
 							)))?;
 						}
 						let rids = iter.next_batch(&txn).await
@@ -442,14 +441,13 @@ impl ExecOperator for IndexScan {
 				}
 
 				(BTreeAccess::Range { from, to }, false) => {
-					let reverse = matches!(direction, ScanDirection::Backward);
-					let mut iter = IndexRangeIterator::with_direction(ns_id, db_id, ix, from.as_ref(), to.as_ref(), reverse)
-						.context("Failed to create iterator")?;
+					let mut iter = IndexRangeIterator::new(ns_id, db_id, ix, from.as_ref(), to.as_ref(), direction).context("Failed to create iterator")?;
+
 					loop {
 						if ctx.cancellation().is_cancelled() {
 							Err(ControlFlow::Err(anyhow::anyhow!(
-								crate::err::Error::QueryCancelled
-							)))?;
+								Error::QueryCancelled
+							)))?
 						}
 						let rids = iter.next_batch(&txn).await
 							.context("Failed to iterate index")?;
@@ -473,9 +471,8 @@ impl ExecOperator for IndexScan {
 
 				// Compound index access — equality prefix only (no range)
 				(BTreeAccess::Compound { prefix, range: None }, _) => {
-					let reverse = matches!(direction, ScanDirection::Backward);
-					let mut iter = CompoundEqualIterator::with_direction(ns_id, db_id, ix, prefix, None, reverse)
-						.context("Failed to create compound iterator")?;
+
+					let mut iter = CompoundEqualIterator::new(ns_id, db_id, ix, prefix, None, direction).context("Failed to create compound iterator")?;
 
 					// Compute the maximum number of index entries we need.
 					// When a LIMIT + START is pushed down AND permissions
@@ -541,9 +538,12 @@ impl ExecOperator for IndexScan {
 
 				// Compound index access — equality prefix with range on next column
 				(BTreeAccess::Compound { prefix, range: Some(range) }, _) => {
-					let reverse = matches!(direction, ScanDirection::Backward);
-					let mut iter = CompoundRangeIterator::with_direction(ns_id, db_id, ix, prefix, range, reverse)
-						.context("Failed to create compound range iterator")?;
+					let iter = match direction {
+						ScanDirection::Forward => CompoundRangeForwardIterator::new(ns_id, db_id, ix, prefix, range),
+						ScanDirection::Backward => todo!(),
+					};
+
+					let mut iter = iter.context("Failed to create compound range iterator")?;
 
 					// Same cap logic as the equality-only compound branch:
 					// only cap when permissions won't filter rows post-fetch.
