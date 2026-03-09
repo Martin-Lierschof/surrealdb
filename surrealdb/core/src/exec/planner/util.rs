@@ -9,6 +9,7 @@ use crate::catalog::Distance;
 use crate::catalog::providers::DatabaseProvider;
 use crate::err::Error;
 use crate::exec::field_path::{FieldPath, FieldPathPart};
+use crate::exec::function::FunctionRegistry;
 use crate::expr::field::{Field, Fields};
 use crate::expr::operator::NearestNeighbor;
 use crate::expr::visit::{MutVisitor, Visit, VisitMut, Visitor};
@@ -77,6 +78,138 @@ pub(crate) fn try_literal_to_value(
 pub(crate) fn try_expr_to_value(expr: &Expr) -> Option<crate::val::Value> {
 	match expr {
 		Expr::Literal(lit) => try_literal_to_value(lit),
+		_ => None,
+	}
+}
+
+// ============================================================================
+// Constant-folding: resolve deterministic expressions to literals
+// ============================================================================
+
+/// Fold constant, document-independent expressions in a `WHERE` condition to
+/// literal values. This enables proper index range access for expressions like
+/// `time::now() - 365d` which would otherwise be opaque to index analysis.
+///
+/// Must be called **after** [`resolve_condition_params`] so that parameter
+/// references have already been replaced with literals.
+///
+/// Only folds expressions that:
+/// - Contain no field/idiom references (document-independent)
+/// - Are deterministic built-in functions or arithmetic on literals
+/// - Pure functions (math::*, string::*, type::*, etc.) where all args are literals
+///
+/// `time::now()` is evaluated once at plan time, consistent with how most
+/// databases evaluate `NOW()` once per statement/transaction.
+pub(crate) fn fold_condition_expressions(cond: &mut Cond, registry: &FunctionRegistry) {
+	let mut folder = ExpressionFolder {
+		registry,
+	};
+	let _ = folder.visit_mut_expr(&mut cond.0);
+}
+
+/// MutVisitor that replaces constant expression subtrees with their literal
+/// values. Processes bottom-up: children are folded first, then the parent
+/// node is checked.
+struct ExpressionFolder<'a> {
+	registry: &'a FunctionRegistry,
+}
+
+impl MutVisitor for ExpressionFolder<'_> {
+	type Error = std::convert::Infallible;
+
+	fn visit_mut_expr(&mut self, expr: &mut Expr) -> Result<(), Self::Error> {
+		// First recurse into children (bottom-up folding)
+		expr.visit_mut(self)?;
+
+		// Then try to fold this node to a literal
+		if let Some(folded) = try_fold_to_literal(expr, self.registry) {
+			*expr = folded;
+		}
+		Ok(())
+	}
+
+	fn visit_mut_select(
+		&mut self,
+		_: &mut crate::expr::SelectStatement,
+	) -> Result<(), Self::Error> {
+		// Don't recurse into subqueries — they have their own planning.
+		Ok(())
+	}
+}
+
+/// Attempt to reduce a constant expression to an `Expr::Literal`.
+///
+/// Handles:
+/// - `time::now()` → `Literal::Datetime(now)` (special case: non-pure but per-statement)
+/// - Pure function calls where all arguments are already literals
+///   (math::floor, string::lowercase, type::int, etc.)
+/// - Binary arithmetic on two literals (datetime ± duration, number ± number, etc.)
+fn try_fold_to_literal(expr: &Expr, registry: &FunctionRegistry) -> Option<Expr> {
+	use crate::expr::Function;
+	use crate::val::{Datetime, Value};
+
+	match expr {
+		// time::now() → current datetime literal
+		// Special case: time::now() is not pure (depends on clock) but we
+		// intentionally fold it once per statement, matching SQL semantics.
+		Expr::FunctionCall(fc)
+			if matches!(&fc.receiver, Function::Normal(name) if name == "time::now")
+				&& fc.arguments.is_empty() =>
+		{
+			Some(Value::Datetime(Datetime::now()).into_literal())
+		}
+
+		// Pure function call where all arguments are already literals.
+		// After bottom-up folding, nested expressions like `math::floor(20 + 0.5)`
+		// will have their arguments folded first, so we only need to check
+		// whether the immediate arguments are literals.
+		Expr::FunctionCall(fc) => {
+			let Function::Normal(name) = &fc.receiver else {
+				return None;
+			};
+			let func = registry.get(name.as_str())?;
+			if !func.is_pure() || func.is_async() {
+				return None;
+			}
+			// All arguments must be convertible to constant Values
+			let args: Option<Vec<Value>> = fc.arguments.iter().map(try_expr_to_value).collect();
+			let args = args?;
+			// Invoke the function synchronously — safe because it's pure
+			let result = func.invoke(args).ok()?;
+			Some(result.into_literal())
+		}
+
+		// Binary operation where both operands are already literals
+		Expr::Binary {
+			left,
+			op,
+			right,
+		} => {
+			let left_val = try_expr_to_value(left)?;
+			let right_val = try_expr_to_value(right)?;
+			let result = try_eval_binary(op, left_val, right_val)?;
+			Some(result.into_literal())
+		}
+
+		_ => None,
+	}
+}
+
+/// Evaluate a binary operation on two concrete Values.
+/// Returns `None` if the operation is unsupported or fails.
+fn try_eval_binary(
+	op: &BinaryOperator,
+	left: crate::val::Value,
+	right: crate::val::Value,
+) -> Option<crate::val::Value> {
+	use crate::val::{TryAdd, TrySub};
+
+	match op {
+		BinaryOperator::Add => left.try_add(right).ok(),
+		BinaryOperator::Subtract => left.try_sub(right).ok(),
+		// We intentionally limit folding to add/sub to avoid unexpected
+		// behavior with division-by-zero, overflow, etc. These cover the
+		// common datetime ± duration patterns.
 		_ => None,
 	}
 }

@@ -164,17 +164,16 @@ impl<'a> IndexAnalyzer<'a> {
 				continue; // Single-element handled by match_operator_to_access; too-large skipped
 			}
 
+			// Track best candidate: prefer compound indexes (more columns
+			// covered = better selectivity and potential ORDER BY coverage).
+			let mut best: Option<(usize, usize)> = None; // (index idx, num cols)
+
 			for (idx, ix_def) in self.indexes.iter().enumerate() {
 				if ix_def.prepare_remove {
 					continue;
 				}
 				if !matches!(ix_def.index, crate::catalog::Index::Idx | crate::catalog::Index::Uniq)
 				{
-					continue;
-				}
-				// Only handle single-column indexes for IN expansion.
-				// Compound indexes would need prefix handling.
-				if ix_def.cols.len() != 1 {
 					continue;
 				}
 
@@ -184,20 +183,46 @@ impl<'a> IndexAnalyzer<'a> {
 					continue;
 				}
 
+				// The IN column must be the FIRST column of the index.
 				if let Some(first_col) = ix_def.cols.first()
 					&& idiom_matches(idiom, first_col)
 				{
-					let index_ref = IndexRef::new(self.indexes.clone(), idx);
-					let paths: Vec<AccessPath> = values
+					let ncols = ix_def.cols.len();
+					if best.map_or(true, |(_, best_ncols)| ncols > best_ncols) {
+						best = Some((idx, ncols));
+					}
+				}
+			}
+
+			if let Some((idx, ncols)) = best {
+				let index_ref = IndexRef::new(self.indexes.clone(), idx);
+				let paths: Vec<AccessPath> = if ncols == 1 {
+					// Single-column index: equality scans
+					values
 						.iter()
 						.map(|v| AccessPath::BTreeScan {
 							index_ref: index_ref.clone(),
 							access: BTreeAccess::Equality(v.clone()),
 							direction,
 						})
-						.collect();
-					return Some(AccessPath::Union(paths));
-				}
+						.collect()
+				} else {
+					// Compound index: prefix scans with IN value as first
+					// column.  The remaining columns provide ordering and
+					// selectivity for other WHERE conditions.
+					values
+						.iter()
+						.map(|v| AccessPath::BTreeScan {
+							index_ref: index_ref.clone(),
+							access: BTreeAccess::Compound {
+								prefix: vec![v.clone()],
+								range: None,
+							},
+							direction,
+						})
+						.collect()
+				};
+				return Some(AccessPath::Union(paths));
 			}
 		}
 
@@ -1064,8 +1089,7 @@ impl<'a> IndexAnalyzer<'a> {
 					let ix_def = candidate.index_ref.definition();
 
 					// Collect equality-prefix column idioms
-					let prefix_cols: Vec<&Idiom> =
-						ix_def.cols.iter().take(prefix.len()).collect();
+					let prefix_cols: Vec<&Idiom> = ix_def.cols.iter().take(prefix.len()).collect();
 
 					// Skip leading ORDER BY fields that match prefix columns
 					let mut order_idx = 0;
@@ -1154,7 +1178,10 @@ impl<'a> IndexAnalyzer<'a> {
 					// index as covering ORDER BY when it only matches the
 					// first ORDER BY field but not subsequent ones.
 					match &candidate.access {
-						BTreeAccess::Compound { .. } | BTreeAccess::Equality(_) => {
+						BTreeAccess::Compound {
+							..
+						}
+						| BTreeAccess::Equality(_) => {
 							// Already analyzed above — don't override
 						}
 						_ => {

@@ -295,7 +295,7 @@ fn make_count_batch(count: usize, field_names: &[String]) -> ValueBatch {
 }
 
 /// Sum the delta entries in `IndexCountKey` for a given COUNT index.
-async fn sum_index_count_deltas(
+pub(crate) async fn sum_index_count_deltas(
 	ctx: &ExecutionContext,
 	txn: &crate::kvs::Transaction,
 	ns: NamespaceId,

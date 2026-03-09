@@ -57,6 +57,13 @@ pub struct IndexScan {
 	/// Plan-time resolved table context. When present, `execute()` skips
 	/// runtime table def + permission lookup.
 	pub(crate) resolved: Option<ResolvedTableContext>,
+	/// Per-batch size ceiling when LIMIT wasn't pushed (due to a residual
+	/// filter preventing direct pushdown).  The scan reads batches of at
+	/// most this many entries, enabling faster early termination from the
+	/// downstream Limit operator.  Does NOT cap total entries — the loop
+	/// continues until either the range is exhausted or the consumer
+	/// drops the stream.
+	pub(crate) batch_ceiling: Option<Arc<dyn PhysicalExpr>>,
 	/// Per-operator runtime metrics for EXPLAIN ANALYZE.
 	pub(crate) metrics: Arc<OperatorMetrics>,
 }
@@ -80,6 +87,7 @@ impl IndexScan {
 			start,
 			version,
 			resolved: None,
+			batch_ceiling: None,
 			metrics: Arc::new(OperatorMetrics::new()),
 		}
 	}
@@ -87,6 +95,18 @@ impl IndexScan {
 	/// Set the plan-time resolved table context.
 	pub(crate) fn with_resolved(mut self, resolved: ResolvedTableContext) -> Self {
 		self.resolved = Some(resolved);
+		self
+	}
+
+	/// Set a per-batch ceiling for downstream LIMIT awareness.
+	///
+	/// When the planner knows there is a downstream LIMIT but cannot push
+	/// it to the scan (residual filter), it passes the user's LIMIT here.
+	/// This makes each batch small so the downstream Limit operator can
+	/// terminate the stream quickly instead of waiting for a full 1000-entry
+	/// batch.
+	pub(crate) fn with_batch_ceiling(mut self, ceiling: Option<Arc<dyn PhysicalExpr>>) -> Self {
+		self.batch_ceiling = ceiling;
 		self
 	}
 }
@@ -298,6 +318,7 @@ impl ExecOperator for IndexScan {
 		let table_name = self.table_name.clone();
 		let limit_expr = self.limit.clone();
 		let start_expr = self.start.clone();
+		let ceiling_expr = self.batch_ceiling.clone();
 		let version_expr = self.version.clone();
 		let resolved = self.resolved.clone();
 		let ctx = ctx.clone();
@@ -318,6 +339,22 @@ impl ExecOperator for IndexScan {
 			let start_val: usize = match &start_expr {
 				Some(expr) => eval_limit_expr(&**expr, &ctx).await?,
 				None => 0,
+			};
+
+			// Evaluate batch ceiling expression (downstream LIMIT hint for
+			// residual-filter queries).  Each batch reads at most this many
+			// index entries so the downstream Limit operator can stop the
+			// stream quickly instead of waiting for a full 1000-entry batch.
+			// We use a 4x multiplier to account for rows rejected by the
+			// residual filter — this keeps the batch large enough to avoid
+			// excessive small-batch round-trips while still being far smaller
+			// than the default 1000-entry INDEX_BATCH_SIZE.
+			let batch_max: u32 = match &ceiling_expr {
+				Some(expr) => {
+					let c = eval_limit_expr(&**expr, &ctx).await?;
+					c.saturating_add(start_val).saturating_mul(4).max(1).min(1000) as u32
+				}
+				None => u32::MAX, // next_batch caps at INDEX_BATCH_SIZE internally
 			};
 
 			// Evaluate VERSION expression
@@ -529,7 +566,9 @@ impl ExecOperator for IndexScan {
 					};
 
 					// Fetch the first batch of record IDs sequentially.
-					let mut rids = iter.next_batch(&txn, remaining).await
+					// Use batch_max to keep batches small when a downstream
+					// LIMIT exists but wasn't pushed (residual filter).
+					let mut rids = iter.next_batch(&txn, remaining.min(batch_max)).await
 						.context("Failed to iterate compound index")?;
 
 					while !rids.is_empty() {
@@ -548,7 +587,7 @@ impl ExecOperator for IndexScan {
 								&ctx, &txn, ns_id, db_id, &rids, &select_permission, check_perms, version,
 								CachePolicy::ReadOnly,
 							);
-							let scan_fut = iter.next_batch(&txn, remaining);
+							let scan_fut = iter.next_batch(&txn, remaining.min(batch_max));
 							let (v, n) = futures::join!(fetch_fut, scan_fut);
 							(v, Some(n))
 						} else {
@@ -593,7 +632,9 @@ impl ExecOperator for IndexScan {
 					};
 
 					// Fetch the first batch of record IDs sequentially.
-					let mut rids = iter.next_batch(&txn, remaining).await
+					// Use batch_max to keep batches small when a downstream
+					// LIMIT exists but wasn't pushed (residual filter).
+					let mut rids = iter.next_batch(&txn, remaining.min(batch_max)).await
 						.context("Failed to iterate compound index")?;
 
 					while !rids.is_empty() {
@@ -611,7 +652,7 @@ impl ExecOperator for IndexScan {
 								&ctx, &txn, ns_id, db_id, &rids, &select_permission, check_perms, version,
 								CachePolicy::ReadOnly,
 							);
-							let scan_fut = iter.next_batch(&txn, remaining);
+							let scan_fut = iter.next_batch(&txn, remaining.min(batch_max));
 							let (v, n) = futures::join!(fetch_fut, scan_fut);
 							(v, Some(n))
 						} else {

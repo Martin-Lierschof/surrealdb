@@ -21,11 +21,11 @@ use super::Planner;
 use super::util::{
 	all_value_sources, check_forbidden_group_by_params, derive_field_name, extract_bruteforce_knn,
 	extract_count_field_names, extract_matches_context, extract_record_id_point_lookup,
-	extract_version, get_effective_limit_literal, has_knn_k_operator, has_knn_operator,
-	has_top_level_or, idiom_to_field_name, idiom_to_field_path, index_covers_ordering,
-	is_count_all_eligible, is_indexed_count_eligible, order_is_scan_compatible,
-	resolve_condition_params, strip_fts_condition, strip_index_conditions,
-	strip_knn_from_condition,
+	extract_version, fold_condition_expressions, get_effective_limit_literal, has_knn_k_operator,
+	has_knn_operator, has_top_level_or, idiom_to_field_name, idiom_to_field_path,
+	index_covers_ordering, is_count_all_eligible, is_indexed_count_eligible,
+	order_is_scan_compatible, resolve_condition_params, strip_fts_condition,
+	strip_index_conditions, strip_knn_from_condition,
 };
 use crate::catalog::providers::{DatabaseProvider, NamespaceProvider, TableProvider};
 use crate::cnf::MAX_ORDER_LIMIT_PRIORITY_QUEUE_SIZE;
@@ -1306,6 +1306,19 @@ impl<'ctx> Planner<'ctx> {
 			None => None,
 		};
 
+		// Fold constant expressions to literals so that index analysis can
+		// create proper range access patterns. Handles:
+		// - time::now() - 365d → datetime literal
+		// - math::floor(20.5) → 20 (any pure function with literal args)
+		// - type::int('42') → 42
+		let cond = match cond {
+			Some(mut c) => {
+				fold_condition_expressions(&mut c, self.function_registry());
+				Some(c)
+			}
+			None => None,
+		};
+
 		// KNN handling
 		let has_knn = cond.as_ref().is_some_and(|c| has_knn_operator(&c.0));
 		let brute_force_knn = if has_knn {
@@ -1675,6 +1688,25 @@ impl<'ctx> Planner<'ctx> {
 						} else {
 							(None, None, false)
 						};
+						// When the limit wasn't pushed (residual filter) but
+						// the index covers ORDER BY, pass the user's LIMIT
+						// as a batch-sizing hint.  This keeps each batch
+						// small (~LIMIT entries) so the downstream Limit
+						// operator can stop the stream quickly instead of
+						// waiting for a full 1000-entry batch.
+						let batch_ceiling = if !push
+							&& scan_limit.is_some()
+							&& matches!(filter_action, FilterAction::Residual(_))
+							&& match order {
+								None => true,
+								Some(ord) => {
+									index_covers_ordering(&index_ref, &access, direction, ord)
+								}
+							} {
+							scan_limit.clone()
+						} else {
+							None
+						};
 						let mut scan = IndexScan::new(
 							index_ref,
 							access,
@@ -1683,7 +1715,8 @@ impl<'ctx> Planner<'ctx> {
 							idx_limit,
 							idx_start,
 							version.clone(),
-						);
+						)
+						.with_batch_ceiling(batch_ceiling);
 						if let Some(ref tc) = table_ctx {
 							scan = scan.with_resolved(tc.clone());
 						}
@@ -2201,10 +2234,18 @@ impl<'ctx> Planner<'ctx> {
 		// branch, which is typically far better than scanning every row
 		// in the index. The outer pipeline adds a Sort when the union
 		// does not satisfy ORDER BY.
-		if path.is_full_range_scan()
-			&& let Some(union_path) = analyzer.try_or_union(cond, direction)
-		{
-			return Ok(Some((union_path, direction)));
+		if path.is_full_range_scan() {
+			if let Some(union_path) = analyzer.try_or_union(cond, direction) {
+				return Ok(Some((union_path, direction)));
+			}
+			// NOTE: We intentionally do NOT try try_in_expansion() here.
+			// The full-range scan covers ORDER BY, enabling sort elimination
+			// and early termination with the batch ceiling.  Replacing it
+			// with a Union of prefix scans would require an expensive Sort
+			// of ALL matching records, which is far worse for ORDER BY +
+			// LIMIT queries.  IN expansion is only helpful in the
+			// candidates.is_empty() fallback above when no index covers
+			// ORDER BY at all.
 		}
 
 		Ok(Some((path, direction)))
