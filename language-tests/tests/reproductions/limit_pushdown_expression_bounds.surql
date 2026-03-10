@@ -15,11 +15,11 @@ value = "None"
 [[test.results]]
 value = "None"
 
-# ASC with literal bounds: 5 rows (records 3-7)
+# ASC with literal bounds: 5 rows (records 3–7)
 [[test.results]]
 value = "[{ id: test:3, score: 30 }, { id: test:4, score: 40 }, { id: test:5, score: 50 }, { id: test:6, score: 60 }, { id: test:7, score: 70 }]"
 
-# DESC with literal bounds: 5 rows (records 7-3)
+# DESC with literal bounds: 5 rows (records 7–3)
 [[test.results]]
 value = "[{ id: test:7, score: 70 }, { id: test:6, score: 60 }, { id: test:5, score: 50 }, { id: test:4, score: 40 }, { id: test:3, score: 30 }]"
 
