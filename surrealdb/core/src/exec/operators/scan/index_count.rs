@@ -486,65 +486,96 @@ async fn count_btree_index_keys(
 				count += rids.len();
 			}
 		}
-		(BTreeAccess::Range { from, to }, true) => {
-			let mut iter =
-				UniqueRangeIterator::new(ns_id, db_id, ix, from.as_ref(), to.as_ref(), ScanDirection::Forward)
-					.context("Failed to create unique range iterator")?;
-			loop {
-				if ctx.cancellation().is_cancelled() {
-					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
-				}
-				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
-				if rids.is_empty() {
-					break;
-				}
-				count += rids.len();
-			}
-		}
-		(BTreeAccess::Range { from, to }, false) => {
-			let mut iter =
-				IndexRangeIterator::new(ns_id, db_id, ix, from.as_ref(), to.as_ref(), ScanDirection::Forward)
-					.context("Failed to create index range iterator")?;
-			loop {
-				if ctx.cancellation().is_cancelled() {
-					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
-				}
-				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
-				if rids.is_empty() {
-					break;
-				}
-				count += rids.len();
-			}
-		}
-		(BTreeAccess::Compound { prefix, range: Some(range) }, _) => {
-			let mut iter =
-				CompoundRangeIterator::new(
-					ns_id, db_id, ix, prefix, range, ScanDirection::Forward,
-				)
-				.context("Failed to create compound range iterator")?;
-			loop {
-				if ctx.cancellation().is_cancelled() {
-					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
-				}
-				let rids =
-					iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
-				if rids.is_empty() {
-					break;
-				}
-				count += rids.len();
-			}
-		}
-		(BTreeAccess::Compound { prefix, range: None }, _) => {
-			let mut iter = CompoundEqualIterator::new(
-				ns_id, db_id, ix, prefix, None, ScanDirection::Forward,
+		(
+			BTreeAccess::Range {
+				from,
+				to,
+			},
+			true,
+		) => {
+			let mut iter = UniqueRangeIterator::new(
+				ns_id,
+				db_id,
+				ix,
+				from.as_ref(),
+				to.as_ref(),
+				ScanDirection::Forward,
 			)
-			.context("Failed to create compound equal iterator")?;
+			.context("Failed to create unique range iterator")?;
 			loop {
 				if ctx.cancellation().is_cancelled() {
 					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
 				}
-				let rids =
-					iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Range {
+				from,
+				to,
+			},
+			false,
+		) => {
+			let mut iter = IndexRangeIterator::new(
+				ns_id,
+				db_id,
+				ix,
+				from.as_ref(),
+				to.as_ref(),
+				ScanDirection::Forward,
+			)
+			.context("Failed to create index range iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Compound {
+				prefix,
+				range: Some(range),
+			},
+			_,
+		) => {
+			let mut iter =
+				CompoundRangeIterator::new(ns_id, db_id, ix, prefix, range, ScanDirection::Forward)
+					.context("Failed to create compound range iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
+				if rids.is_empty() {
+					break;
+				}
+				count += rids.len();
+			}
+		}
+		(
+			BTreeAccess::Compound {
+				prefix,
+				range: None,
+			},
+			_,
+		) => {
+			let mut iter =
+				CompoundEqualIterator::new(ns_id, db_id, ix, prefix, None, ScanDirection::Forward)
+					.context("Failed to create compound equal iterator")?;
+			loop {
+				if ctx.cancellation().is_cancelled() {
+					return Err(ControlFlow::Err(anyhow::anyhow!(Error::QueryCancelled)));
+				}
+				let rids = iter.next_batch(txn, 1000).await.context("Failed to iterate index")?;
 				if rids.is_empty() {
 					break;
 				}
