@@ -164,8 +164,14 @@ impl<'a> IndexAnalyzer<'a> {
 				continue; // Single-element handled by match_operator_to_access; too-large skipped
 			}
 
-			// Track best candidate: prefer compound indexes (more columns
-			// covered = better selectivity and potential ORDER BY coverage).
+			// Track best candidate: prefer single-column indexes (fewer
+			// columns) because they produce BTreeAccess::Equality sub-paths
+			// which enable merge-by-id on UnionIndexScan for ORDER BY id
+			// sort elimination.  Multi-column indexes create Compound
+			// sub-paths that are sorted by remaining columns, not by id,
+			// so they cannot participate in the merge optimisation.  When
+			// no single-column index exists, we fall back to the narrowest
+			// compound index available.
 			let mut best: Option<(usize, usize)> = None; // (index idx, num cols)
 
 			for (idx, ix_def) in self.indexes.iter().enumerate() {
@@ -188,7 +194,7 @@ impl<'a> IndexAnalyzer<'a> {
 					&& idiom_matches(idiom, first_col)
 				{
 					let ncols = ix_def.cols.len();
-					if best.map_or(true, |(_, best_ncols)| ncols > best_ncols) {
+					if best.map_or(true, |(_, best_ncols)| ncols < best_ncols) {
 						best = Some((idx, ncols));
 					}
 				}

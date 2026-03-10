@@ -169,8 +169,16 @@ impl ExecOperator for UnionIndexScan {
 		// so that any setup errors surface immediately.
 		let mut sub_streams: Vec<ValueBatchStream> = Vec::with_capacity(self.inputs.len());
 		for input in &self.inputs {
-			let sub_stream =
-				buffer_stream(input.execute(ctx)?, input.access_mode(), input.cardinality_hint());
+			let stream = input.execute(ctx)?;
+			// In merge mode, consume sub-streams on-demand — no buffering.
+			// This prevents background tasks from eagerly fetching entire
+			// equality ranges when only a small number of records are
+			// needed (e.g. ORDER BY id LIMIT 25).
+			let sub_stream = if self.merge_by_id.is_some() {
+				stream
+			} else {
+				buffer_stream(stream, input.access_mode(), input.cardinality_hint())
+			};
 			sub_streams.push(sub_stream);
 		}
 

@@ -1130,34 +1130,44 @@ impl<'ctx> Planner<'ctx> {
 		}
 
 		// Indexed COUNT fast-path (COUNT with WHERE + matching COUNT index)
+		// Skip when WITH NOINDEX is specified — the user explicitly forbids
+		// index-assisted execution.
 		if is_indexed_count_eligible(&fields, &group, &cond, &split, &order, &fetch, &omit, &what)
-			&& self.has_matching_count_index(&what, &cond).await
+			&& !matches!(with, Some(crate::expr::with::With::NoIndex))
 		{
-			use crate::exec::operators::scan::index_count::IndexCountScan;
-			let table_expr =
-				self.physical_expr(what.first().cloned().expect("what verified non-empty")).await?;
-			let condition = cond.clone().expect("is_indexed_count_eligible requires cond");
-			let predicate = self.physical_expr(condition.0.clone()).await?;
-			let field_names = extract_count_field_names(&fields);
-			let index_count_scan: Arc<dyn ExecOperator> = Arc::new(IndexCountScan::new(
-				table_expr,
-				predicate,
-				condition,
-				version,
-				field_names,
-			));
-			let timed = match timeout {
-				Expr::Literal(Literal::None) => index_count_scan,
-				te => {
-					let tp = self.physical_expr(te).await?;
-					Arc::new(Timeout::new(index_count_scan, Some(tp))) as Arc<dyn ExecOperator>
-				}
-			};
-			return if only {
-				Ok(Arc::new(UnwrapExactlyOne::new(timed, true)))
+			// Try COUNT index first, then B-tree index for key-only counting.
+			let has_count_idx = self.has_matching_count_index(&what, &cond).await;
+			let btree_access = if !has_count_idx {
+				self.resolve_count_btree_access(&what, &cond).await
 			} else {
-				Ok(timed)
+				None
 			};
+
+			if has_count_idx || btree_access.is_some() {
+				use crate::exec::operators::scan::index_count::IndexCountScan;
+				let table_expr = self
+					.physical_expr(what.first().cloned().expect("what verified non-empty"))
+					.await?;
+				let condition = cond.clone().expect("is_indexed_count_eligible requires cond");
+				let predicate = self.physical_expr(condition.0.clone()).await?;
+				let field_names = extract_count_field_names(&fields);
+				let index_count_scan: Arc<dyn ExecOperator> = Arc::new(
+					IndexCountScan::new(table_expr, predicate, condition, version, field_names)
+						.with_btree_access(btree_access),
+				);
+				let timed = match timeout {
+					Expr::Literal(Literal::None) => index_count_scan,
+					te => {
+						let tp = self.physical_expr(te).await?;
+						Arc::new(Timeout::new(index_count_scan, Some(tp))) as Arc<dyn ExecOperator>
+					}
+				};
+				return if only {
+					Ok(Arc::new(UnwrapExactlyOne::new(timed, true)))
+				} else {
+					Ok(timed)
+				};
+			}
 		}
 
 		// Fast path: SELECT [*|fields] FROM <literal RecordId>
@@ -1840,6 +1850,17 @@ impl<'ctx> Planner<'ctx> {
 							})
 						});
 
+						// When merge mode is active and a downstream LIMIT
+						// exists, pass it as a batch ceiling to each
+						// sub-scan.  This keeps each index batch small
+						// (4× the LIMIT) so the merge terminates quickly
+						// instead of fetching a full 1000-entry batch.
+						let merge_batch_ceiling = if merge_dir.is_some() {
+							scan_limit.clone()
+						} else {
+							None
+						};
+
 						let mut sub_operators: Vec<Arc<dyn ExecOperator>> =
 							Vec::with_capacity(paths.len());
 						for path in paths {
@@ -1858,6 +1879,9 @@ impl<'ctx> Planner<'ctx> {
 										None,
 										version.clone(),
 									);
+									if let Some(ref ceiling) = merge_batch_ceiling {
+										scan = scan.with_batch_ceiling(Some(Arc::clone(ceiling)));
+									}
 									if let Some(ref tc) = table_ctx {
 										scan = scan.with_resolved(tc.clone());
 									}
@@ -2152,6 +2176,57 @@ impl<'ctx> Planner<'ctx> {
 				false
 			}
 		})
+	}
+
+	/// Resolve a B-tree index access path covering the WHERE condition for
+	/// key-only counting.  Returns `Some((IndexRef, BTreeAccess))` when the
+	/// index analysis finds a B-tree index that fully covers the predicate
+	/// (no residual filter), allowing `IndexCountScan` to count index keys
+	/// instead of deserializing records.
+	async fn resolve_count_btree_access(
+		&self,
+		what: &[Expr],
+		cond: &Option<Cond>,
+	) -> Option<(
+		crate::exec::index::access_path::IndexRef,
+		crate::exec::index::access_path::BTreeAccess,
+	)> {
+		let txn = self.txn.as_ref()?;
+		let ns_name = self.ns.as_ref()?;
+		let db_name = self.db.as_ref()?;
+		let table_name = match what.first() {
+			Some(Expr::Table(t)) => t,
+			_ => return None,
+		};
+		let cond = cond.as_ref()?;
+
+		let ns_def = txn.get_ns_by_name(ns_name).await.ok()??;
+		let db_def = txn.get_db_by_name(ns_name, db_name).await.ok()??;
+		let indexes =
+			txn.all_tb_indexes(ns_def.namespace_id, db_def.database_id, table_name).await.ok()?;
+
+		if indexes.is_empty() {
+			return None;
+		}
+
+		// Run the index analyzer to find candidate access paths.
+		// We pass None for order since we don't care about ordering for counting.
+		let analyzer = IndexAnalyzer::new(indexes, None);
+		let candidates = analyzer.analyze(Some(cond), None);
+
+		// Look for a candidate that fully covers the WHERE condition
+		// (no residual filter needed).
+		for candidate in &candidates {
+			// Check: does this index access fully cover the condition?
+			// If strip_index_conditions returns None, the index
+			// consumed the entire WHERE clause.
+			if strip_index_conditions(cond, &candidate.access, &candidate.index_ref.cols).is_none()
+			{
+				return Some((candidate.index_ref.clone(), candidate.access.clone()));
+			}
+		}
+
+		None
 	}
 
 	/// Resolve the optimal access path for a table at plan time.
