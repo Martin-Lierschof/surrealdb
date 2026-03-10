@@ -5,13 +5,17 @@ database = true
 auth = { level = "owner" }
 
 [test]
-reason = "WHERE IN + ORDER BY + LIMIT must return correct row count when a separate ORDER BY index exists"
+reason = "WHERE IN + ORDER BY + LIMIT must return correct row count when compound and single-field indexes coexist"
 
 # DEFINE INDEX idx_status
 [[test.results]]
 value = "None"
 
-# DEFINE INDEX idx_ts (separate ORDER BY index — key to triggering the bug)
+# DEFINE INDEX idx_ts
+[[test.results]]
+value = "None"
+
+# DEFINE INDEX idx_status_ts (compound)
 [[test.results]]
 value = "None"
 
@@ -26,22 +30,24 @@ value = "[{ id: item:1, status: 'active', ts: d'2025-01-01T00:00:00Z' }, { id: i
 # DESC LIMIT 8: last 8 of 20 matching rows by ts order
 [[test.results]]
 value = "[{ id: item:29, status: 'pending', ts: d'2025-01-29T00:00:00Z' }, { id: item:28, status: 'active', ts: d'2025-01-28T00:00:00Z' }, { id: item:26, status: 'pending', ts: d'2025-01-26T00:00:00Z' }, { id: item:25, status: 'active', ts: d'2025-01-25T00:00:00Z' }, { id: item:23, status: 'pending', ts: d'2025-01-23T00:00:00Z' }, { id: item:22, status: 'active', ts: d'2025-01-22T00:00:00Z' }, { id: item:20, status: 'pending', ts: d'2025-01-20T00:00:00Z' }, { id: item:19, status: 'active', ts: d'2025-01-19T00:00:00Z' }]"
+
 */
 
--- Two separate indexes: idx_status for WHERE, idx_ts for ORDER BY.
--- The planner may choose idx_ts for ORDER BY coverage and incorrectly push LIMIT
--- into the IndexScan, causing the WHERE filter to reduce results below LIMIT.
+-- Three indexes: the planner may choose idx_status_ts (compound)
+-- or idx_ts for ORDER BY coverage. Either way, LIMIT must not be
+-- pushed when the WHERE clause produces a residual filter.
 DEFINE INDEX idx_status ON item FIELDS status;
 DEFINE INDEX idx_ts ON item FIELDS ts;
+DEFINE INDEX idx_status_ts ON item FIELDS status, ts;
 
--- Create 30 records: cycling active/pending/archived (10 each)
+-- 30 records cycling active/pending/archived (10 each)
 FOR $i IN 1..=30 {
     CREATE type::record('item', $i) SET
         status = ['active', 'pending', 'archived'][($i - 1) % 3],
         ts = d'2025-01-01T00:00:00Z' + duration::from_days($i - 1);
 };
 
--- 20 matching rows (active + pending), LIMIT 8 — must return exactly 8
+-- 20 matching rows (active + pending), LIMIT 8
 SELECT id, status, ts FROM item
   WHERE status IN ['active', 'pending']
   ORDER BY ts ASC LIMIT 8;

@@ -7,28 +7,28 @@ auth = { level = "owner" }
 [test]
 reason = "LIMIT must not be pushed to IndexScan when there is a residual filter (expression-valued WHERE bounds)"
 
+# DEFINE INDEX
 [[test.results]]
--- DEFINE INDEX
 value = "None"
 
+# FOR loop creating 10 records
 [[test.results]]
--- FOR loop creating 10 records
 value = "None"
 
+# ASC with literal bounds: 5 rows (records 3–7)
 [[test.results]]
--- ASC with literal bounds: 5 rows (records 3–7)
 value = "[{ id: test:3, score: 30 }, { id: test:4, score: 40 }, { id: test:5, score: 50 }, { id: test:6, score: 60 }, { id: test:7, score: 70 }]"
 
+# DESC with literal bounds: 5 rows (records 7–3)
 [[test.results]]
--- DESC with literal bounds: 5 rows (records 7–3)
 value = "[{ id: test:7, score: 70 }, { id: test:6, score: 60 }, { id: test:5, score: 50 }, { id: test:4, score: 40 }, { id: test:3, score: 30 }]"
 
+# ASC with expression bounds: must also return 5 rows
 [[test.results]]
--- ASC with expression bounds: must also return 5 rows
 value = "[{ id: test:3, score: 30 }, { id: test:4, score: 40 }, { id: test:5, score: 50 }, { id: test:6, score: 60 }, { id: test:7, score: 70 }]"
 
+# DESC with expression bounds: must also return 5 rows
 [[test.results]]
--- DESC with expression bounds: must also return 5 rows
 value = "[{ id: test:7, score: 70 }, { id: test:6, score: 60 }, { id: test:5, score: 50 }, { id: test:4, score: 40 }, { id: test:3, score: 30 }]"
 */
 
@@ -37,7 +37,7 @@ DEFINE INDEX idx_score ON test FIELDS score;
 
 -- Create 10 records with known scores
 FOR $i IN 1..=10 {
-    CREATE type::thing('test', $i) SET score = $i * 10;
+    CREATE type::record('test', $i) SET score = $i * 10;
 };
 
 -- Literal bounds: range 20 < score < 80 → 5 matching rows (30,40,50,60,70)
