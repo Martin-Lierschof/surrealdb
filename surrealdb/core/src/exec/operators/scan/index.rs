@@ -13,7 +13,7 @@ use super::pipeline::eval_limit_expr;
 use super::resolved::ResolvedTableContext;
 use crate::err::Error;
 use crate::exec::index::access_path::{BTreeAccess, IndexRef};
-use crate::exec::index::iterator::btree::{CompoundEqualIterator, CompoundRangeForwardIterator};
+use crate::exec::index::iterator::btree::{CompoundEqualIterator, CompoundRangeIterator};
 use crate::exec::index::iterator::{
 	IndexEqualIterator, IndexRangeIterator, UniqueEqualIterator, UniqueRangeIterator,
 };
@@ -538,12 +538,7 @@ impl ExecOperator for IndexScan {
 
 				// Compound index access — equality prefix with range on next column
 				(BTreeAccess::Compound { prefix, range: Some(range) }, _) => {
-					let iter = match direction {
-						ScanDirection::Forward => CompoundRangeForwardIterator::new(ns_id, db_id, ix, prefix, range),
-						ScanDirection::Backward => todo!(),
-					};
-
-					let mut iter = iter.context("Failed to create compound range iterator")?;
+					let mut iter = CompoundRangeIterator::new(ns_id, db_id, ix, prefix, range, direction).context("Failed to create compound range iterator")?;
 
 					// Same cap logic as the equality-only compound branch:
 					// only cap when permissions won't filter rows post-fetch.

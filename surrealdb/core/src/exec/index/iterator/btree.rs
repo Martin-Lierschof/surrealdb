@@ -1,8 +1,40 @@
-//! B-tree index iterators for Idx and Uniq indexes.
+//! B-tree index iterators for `Idx` (non-unique) and `Uniq` (unique) indexes.
 //!
-//! These iterators provide efficient record retrieval using B-tree index structures.
-//! They support equality lookups, range scans, compound prefix scans, and union
-//! operations.
+//! These iterators provide efficient, batched record retrieval using B-tree
+//! index structures.  They support:
+//!
+//! - **Equality lookups** – [`IndexEqualIterator`] / [`UniqueEqualIterator`]
+//! - **Range scans** – [`IndexRangeIterator`] / [`UniqueRangeIterator`]
+//! - **Compound prefix scans** – [`CompoundEqualIterator`] / [`CompoundRangeForwardIterator`]
+//!
+//! ### Batching strategy
+//!
+//! All iterators produce records in batches of up to [`INDEX_BATCH_SIZE`].
+//! After each batch the iterator advances (or retreats, for backward scans)
+//! a cursor so the next call resumes where the previous one left off.
+//!
+//! ### KV range convention
+//!
+//! The underlying KV store uses **half-open** ranges `[beg, end)`.  This
+//! means:
+//! - `beg` is *included* in the scan result.
+//! - `end` is *excluded* from the scan result.
+//!
+//! For **forward** scans (`tx.scan`), each batch advances `beg` past the
+//! last returned key (by appending `0x00`).  For **backward** scans
+//! (`tx.scanr`), each batch retreats `end` to the last returned key
+//! (which is then excluded from the next batch by the half-open semantics).
+//!
+//! ### Exclusive boundary handling
+//!
+//! When a query boundary is *exclusive* (e.g. `v > 5`), the computed key
+//! may still fall inside the half-open range.  The iterators handle this
+//! with post-scan filtering:
+//!
+//! - **Leading-edge** boundary (the first key that might appear): filtered on the *first* batch
+//!   only, then the flag is cleared.
+//! - **Trailing-edge** boundary (the last key that might appear, relevant for backward scans where
+//!   `beg` stays fixed): filtered on *every* batch because the cursor never moves past it.
 
 use anyhow::Result;
 
@@ -14,9 +46,18 @@ use crate::key::index::Index;
 use crate::kvs::{KVKey, Key, Transaction, Val};
 use crate::val::{Array, RecordId, Value};
 
-/// Batch size for index scans.
+/// Maximum number of KV entries fetched per batch in index scans.
+///
+/// A larger value reduces round-trips to the KV store but increases
+/// per-batch memory usage.  Range iterators request exactly this many
+/// entries; unique-index iterators request `INDEX_BATCH_SIZE + 1` so
+/// they can detect exhaustion in a single round-trip.
 const INDEX_BATCH_SIZE: u32 = 1000;
 
+/// Decode a batch of KV pairs into [`RecordId`]s.
+///
+/// The key is ignored; only the value (a revision-encoded `RecordId`) is
+/// deserialized.  Used by iterators that do not need per-key filtering.
 fn decode_record_ids(res: Vec<(Key, Val)>) -> Result<Vec<RecordId>> {
 	let mut records = Vec::with_capacity(res.len());
 	for (_, val) in res {
@@ -26,20 +67,23 @@ fn decode_record_ids(res: Vec<(Key, Val)>) -> Result<Vec<RecordId>> {
 	Ok(records)
 }
 
-/// Iterator for equality lookups on non-unique indexes.
+/// Iterator for equality lookups on non-unique (`Idx`) indexes.
 ///
-/// Scans all records matching a specific key value.
+/// Non-unique indexes store one KV entry per (value, record-id) pair, so an
+/// equality lookup may match many entries.  This iterator scans the
+/// half-open range `[prefix_ids_beg, prefix_ids_end)` in forward order,
+/// advancing the `beg` cursor after each batch.
 pub(crate) struct IndexEqualIterator {
-	/// Current scan position (begin key)
+	/// Lower bound of the remaining scan range (inclusive).
 	beg: Vec<u8>,
-	/// End key (exclusive)
+	/// Upper bound of the scan range (exclusive, fixed).
 	end: Vec<u8>,
-	/// Whether iteration is complete
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
 impl IndexEqualIterator {
-	/// Create a new equality iterator.
+	/// Create a new equality iterator for the given index value.
 	pub(crate) fn new(
 		ns: NamespaceId,
 		db: DatabaseId,
@@ -56,7 +100,9 @@ impl IndexEqualIterator {
 		})
 	}
 
-	/// Fetch the next batch of record IDs.
+	/// Fetch the next batch of matching record IDs.
+	///
+	/// Returns an empty `Vec` when iteration is complete.
 	pub async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		if self.done {
 			return Ok(Vec::new());
@@ -69,7 +115,9 @@ impl IndexEqualIterator {
 			return Ok(Vec::new());
 		}
 
-		// Update begin key for next batch
+		// Advance `beg` past the last returned key so the next batch
+		// starts immediately after it.  Appending 0x00 ensures the key
+		// is strictly greater than the last returned key.
 		if let Some((key, _)) = res.last() {
 			self.beg.clone_from(key);
 			self.beg.push(0x00);
@@ -79,11 +127,13 @@ impl IndexEqualIterator {
 	}
 }
 
-/// Iterator for equality lookups on unique indexes.
+/// Iterator for equality lookups on unique (`Uniq`) indexes.
 ///
-/// Returns at most one record.
+/// A unique index stores exactly one KV entry per indexed value, so an
+/// equality lookup is a single point-get.  The key is consumed on the
+/// first call; subsequent calls return an empty batch.
 pub(crate) struct UniqueEqualIterator {
-	/// The key to look up
+	/// The key to look up, consumed (`take`) on the first call.
 	key: Option<Key>,
 }
 
@@ -102,7 +152,9 @@ impl UniqueEqualIterator {
 		})
 	}
 
-	/// Fetch the record ID (if any).
+	/// Fetch the single matching record ID, if it exists.
+	///
+	/// Returns at most one element on the first call; always empty afterwards.
 	pub async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		let Some(key) = self.key.take() else {
 			return Ok(Vec::new());
@@ -118,6 +170,13 @@ impl UniqueEqualIterator {
 }
 
 /// Compute the begin key for a non-unique index range scan.
+///
+/// Returns `(key, inclusive)` where:
+/// - **inclusive bound** (`>=`): uses `prefix_ids_beg` so the scan starts at the first entry for
+///   the given value.
+/// - **exclusive bound** (`>`): uses `prefix_ids_end` so the scan starts *after* all entries for
+///   the given value.
+/// - **no bound**: uses the index-wide `prefix_beg` (start of index).
 fn compute_index_range_beg_key(
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -137,6 +196,13 @@ fn compute_index_range_beg_key(
 }
 
 /// Compute the end key for a non-unique index range scan.
+///
+/// Returns `(key, inclusive)` where:
+/// - **inclusive bound** (`<=`): uses `prefix_ids_end` so the scan covers all entries for the given
+///   value.
+/// - **exclusive bound** (`<`): uses `prefix_ids_beg` so the scan stops *before* any entry for the
+///   given value.
+/// - **no bound**: uses the index-wide `prefix_end` (end of index).
 fn compute_index_range_end_key(
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -155,15 +221,24 @@ fn compute_index_range_end_key(
 	}
 }
 
-/// Forward iterator for range scans on non-unique indexes.
+/// Forward iterator for range scans on non-unique (`Idx`) indexes.
 ///
-/// Uses `tx.scan()` and advances the `beg` cursor after each batch.
-/// An exclusive `beg` boundary is filtered on the first batch only.
+/// Scans `[beg, end)` using `tx.scan()`, advancing the `beg` cursor after
+/// each batch.  When the lower bound is *exclusive*, the first batch
+/// filters out keys equal to the original `beg` (the "leading-edge" key).
+/// Once that first batch is processed, `beg_checked` is set to `true` and
+/// no further filtering is needed because `beg` has already been advanced
+/// past the excluded key.
 pub(crate) struct IndexRangeForwardIterator {
+	/// Lower bound of the remaining scan range (advances after each batch).
 	beg: Key,
+	/// Upper bound of the scan range (fixed).
 	end: Key,
-	/// Whether the exclusive `beg` boundary has already been filtered.
+	/// `true` once the leading-edge exclusive boundary has been handled.
+	/// Initialised to `true` when the lower bound is inclusive (no
+	/// filtering required).
 	beg_checked: bool,
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
@@ -186,12 +261,17 @@ impl IndexRangeForwardIterator {
 		})
 	}
 
+	/// Fetch the next batch of record IDs in ascending key order.
+	///
+	/// On the first call, if the lower bound is exclusive, any key matching
+	/// the original `beg` is skipped.  Subsequent batches need no such
+	/// check because `beg` has already been advanced past that key.
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		if self.done {
 			return Ok(Vec::new());
 		}
 
-		// Save the beg key before scan advances it, for exclusive filtering.
+		// Capture the key to exclude *before* we advance the cursor.
 		let check_exclusive_beg = if self.beg_checked {
 			None
 		} else {
@@ -205,7 +285,7 @@ impl IndexRangeForwardIterator {
 			return Ok(Vec::new());
 		}
 
-		// Advance beg cursor past the last returned key
+		// Advance `beg` past the last returned key for the next batch.
 		if let Some((key, _)) = res.last() {
 			self.beg.clone_from(key);
 			self.beg.push(0x00);
@@ -215,6 +295,7 @@ impl IndexRangeForwardIterator {
 
 		let mut records = Vec::with_capacity(res.len());
 		for (key, val) in res {
+			// Skip the excluded leading-edge key (first batch only).
 			if let Some(ref exclusive_key) = check_exclusive_beg
 				&& key == *exclusive_key
 			{
@@ -228,20 +309,30 @@ impl IndexRangeForwardIterator {
 	}
 }
 
-/// Backward iterator for range scans on non-unique indexes.
+/// Backward iterator for range scans on non-unique (`Idx`) indexes.
 ///
-/// Uses `tx.scanr()` and retreats the `end` cursor after each batch.
-/// An exclusive `end` boundary is filtered on the first batch.
-/// An exclusive `beg` boundary is filtered on every batch (since `beg`
-/// is included by the half-open range `[beg, end)`).
+/// Scans `[beg, end)` using `tx.scanr()`, retreating the `end` cursor
+/// after each batch.  Two kinds of exclusive-boundary filtering apply:
+///
+/// 1. **Leading-edge (`end`)**: When the upper bound is exclusive, the first batch filters out keys
+///    equal to `end`.  After that batch `end` is retreated, so the excluded key can never reappear.
+///    `end_checked` tracks whether this has been done.
+///
+/// 2. **Trailing-edge (`beg`)**: When the lower bound is exclusive, `beg` remains fixed throughout
+///    iteration (only `end` moves).  Therefore the excluded key can appear in *any* batch and must
+///    be filtered on *every* call.  `exclude_beg_key` holds the key to filter.
 pub(crate) struct IndexRangeBackwardIterator {
+	/// Lower bound of the scan range (fixed; only `end` moves).
 	beg: Key,
+	/// Upper bound of the remaining scan range (retreats after each batch).
 	end: Key,
-	/// Whether the exclusive `end` boundary has already been filtered.
+	/// `true` once the leading-edge exclusive `end` boundary has been
+	/// handled.  Initialised to `true` when the upper bound is inclusive.
 	end_checked: bool,
-	/// Key to exclude at the `beg` edge (checked on every batch).
-	/// Set when the lower bound is exclusive.
+	/// Key to exclude at the `beg` (trailing) edge.  `Some` when the
+	/// lower bound is exclusive; checked on every batch.
 	exclude_beg_key: Option<Key>,
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
@@ -271,12 +362,18 @@ impl IndexRangeBackwardIterator {
 		})
 	}
 
+	/// Fetch the next batch of record IDs in descending key order.
+	///
+	/// On the first call, if the upper bound is exclusive, keys equal to
+	/// `end` are skipped.  On *every* call, if the lower bound is exclusive,
+	/// keys equal to the original `beg` are skipped (because `beg` is fixed
+	/// and the half-open range always includes it).
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		if self.done {
 			return Ok(Vec::new());
 		}
 
-		// Save the end key before scan retreats it, for exclusive filtering.
+		// Capture the key to exclude *before* we retreat the cursor.
 		let check_exclusive_end = if self.end_checked {
 			None
 		} else {
@@ -290,7 +387,9 @@ impl IndexRangeBackwardIterator {
 			return Ok(Vec::new());
 		}
 
-		// Retreat end cursor to the last returned key
+		// Retreat `end` to the last returned key.  The half-open range
+		// `[beg, end)` will then exclude this key on the next batch,
+		// preventing duplicates.
 		if let Some((key, _)) = res.last() {
 			self.end.clone_from(key);
 		}
@@ -299,11 +398,13 @@ impl IndexRangeBackwardIterator {
 
 		let mut records = Vec::with_capacity(res.len());
 		for (key, val) in res {
+			// Skip the excluded leading-edge key (first batch only).
 			if let Some(ref exclusive_key) = check_exclusive_end
 				&& key == *exclusive_key
 			{
 				continue;
 			}
+			// Skip the excluded trailing-edge key (every batch).
 			if let Some(ref beg_key) = self.exclude_beg_key
 				&& key == *beg_key
 			{
@@ -317,14 +418,18 @@ impl IndexRangeBackwardIterator {
 	}
 }
 
-/// Enum dispatching range scans on non-unique indexes to the
-/// appropriate direction-specific iterator.
+/// Direction-dispatching wrapper for range scans on non-unique indexes.
+///
+/// Delegates to [`IndexRangeForwardIterator`] or
+/// [`IndexRangeBackwardIterator`] depending on the [`ScanDirection`]
+/// provided at construction time.
 pub(crate) enum IndexRangeIterator {
 	Forward(IndexRangeForwardIterator),
 	Backward(IndexRangeBackwardIterator),
 }
 
 impl IndexRangeIterator {
+	/// Create a new range iterator for the given direction.
 	pub(crate) fn new(
 		ns: NamespaceId,
 		db: DatabaseId,
@@ -343,6 +448,7 @@ impl IndexRangeIterator {
 		}
 	}
 
+	/// Fetch the next batch, delegating to the inner iterator.
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		match self {
 			Self::Forward(iter) => iter.next_batch(tx).await,
@@ -356,6 +462,11 @@ impl IndexRangeIterator {
 // ---------------------------------------------------------------------------
 
 /// Compute the begin key for a unique index range scan.
+///
+/// Unlike the non-unique variant, a unique index stores a single key per
+/// value (no per-record-id suffix).  Therefore the key is always the
+/// exact encoded value; the `inclusive` flag is passed through so the
+/// caller can decide how to filter.
 fn compute_unique_range_beg_key(
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -372,6 +483,10 @@ fn compute_unique_range_beg_key(
 }
 
 /// Compute the end key for a unique index range scan.
+///
+/// See [`compute_unique_range_beg_key`] for the rationale.  The key is
+/// the exact encoded value; `inclusive` indicates whether the caller
+/// should include or exclude it.
 fn compute_unique_range_end_key(
 	ns: NamespaceId,
 	db: DatabaseId,
@@ -387,19 +502,29 @@ fn compute_unique_range_end_key(
 	}
 }
 
-/// Forward iterator for range scans on unique indexes.
+/// Forward iterator for range scans on unique (`Uniq`) indexes.
 ///
-/// Uses `tx.scan()` and advances the `beg` cursor after each batch.
-/// An exclusive `beg` boundary is filtered on the first batch.
-/// An inclusive `end` boundary triggers a final `get()` when the scan
-/// is exhausted (because the half-open range `[beg, end)` excludes `end`).
+/// Works similarly to [`IndexRangeForwardIterator`] but operates on unique
+/// indexes where each value maps to a single key.  The scan uses
+/// `tx.scan()` with an over-sized limit (`INDEX_BATCH_SIZE + 1`) and
+/// advances `beg` after each batch.
+///
+/// Because the half-open range `[beg, end)` inherently *excludes* `end`,
+/// an **inclusive** upper bound needs special treatment: when the scan is
+/// exhausted (empty result), a final `tx.get(end)` is issued to retrieve
+/// the boundary value that the half-open range missed.
 pub(crate) struct UniqueRangeForwardIterator {
+	/// Lower bound of the remaining scan range (advances after each batch).
 	beg: Key,
+	/// Upper bound of the scan range (fixed).
 	end: Key,
-	/// Whether the exclusive `beg` boundary has already been filtered.
+	/// `true` once the leading-edge exclusive `beg` boundary has been
+	/// handled.  Initialised to `true` when the lower bound is inclusive.
 	beg_checked: bool,
-	/// Whether an inclusive `end` needs a trailing get().
+	/// `true` when the upper bound is inclusive and a trailing `get(end)`
+	/// should be attempted once the scan is exhausted.
 	end_inclusive: bool,
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
@@ -423,11 +548,18 @@ impl UniqueRangeForwardIterator {
 		})
 	}
 
+	/// Fetch the next batch of record IDs in ascending key order.
+	///
+	/// On the first call, if the lower bound is exclusive, keys equal to
+	/// the original `beg` are skipped.  When the scan is exhausted and
+	/// `end_inclusive` is `true`, a final point-get on `end` retrieves the
+	/// boundary value that the half-open range excluded.
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		if self.done {
 			return Ok(Vec::new());
 		}
 
+		// Capture the key to exclude *before* we advance the cursor.
 		let check_exclusive_beg = if self.beg_checked {
 			None
 		} else {
@@ -439,6 +571,8 @@ impl UniqueRangeForwardIterator {
 
 		if res.is_empty() {
 			self.done = true;
+			// Inclusive upper bound: the half-open range excluded `end`,
+			// so try a direct point-get to include it.
 			if self.end_inclusive
 				&& let Some(val) = tx.get(&self.end, None).await?
 			{
@@ -448,6 +582,7 @@ impl UniqueRangeForwardIterator {
 			return Ok(Vec::new());
 		}
 
+		// Advance `beg` past the last returned key for the next batch.
 		if let Some((key, _)) = res.last() {
 			self.beg.clone_from(key);
 			self.beg.push(0x00);
@@ -457,6 +592,7 @@ impl UniqueRangeForwardIterator {
 
 		let mut records = Vec::with_capacity(res.len());
 		for (key, val) in res {
+			// Skip the excluded leading-edge key (first batch only).
 			if let Some(ref exclusive_key) = check_exclusive_beg
 				&& key == *exclusive_key
 			{
@@ -470,19 +606,27 @@ impl UniqueRangeForwardIterator {
 	}
 }
 
-/// Backward iterator for range scans on unique indexes.
+/// Backward iterator for range scans on unique (`Uniq`) indexes.
 ///
+/// Works similarly to [`IndexRangeBackwardIterator`] but for unique indexes.
 /// Uses `tx.scanr()` and retreats the `end` cursor after each batch.
-/// An exclusive `end` boundary is filtered on the first batch.
-/// An exclusive `beg` boundary is filtered on every batch (since `beg`
-/// is included by the half-open range `[beg, end)`).
+///
+/// Exclusive boundary handling follows the same leading-edge / trailing-edge
+/// pattern described on [`IndexRangeBackwardIterator`]:
+/// - `end_checked` guards the first-batch-only filter for an exclusive `end`.
+/// - `exclude_beg_key` is checked on every batch for an exclusive `beg`.
 pub(crate) struct UniqueRangeBackwardIterator {
+	/// Lower bound of the scan range (fixed; only `end` moves).
 	beg: Key,
+	/// Upper bound of the remaining scan range (retreats after each batch).
 	end: Key,
-	/// Whether the exclusive `end` boundary has already been filtered.
+	/// `true` once the leading-edge exclusive `end` boundary has been
+	/// handled.  Initialised to `true` when the upper bound is inclusive.
 	end_checked: bool,
-	/// Key to exclude at the `beg` edge (checked on every batch).
+	/// Key to exclude at the `beg` (trailing) edge.  `Some` when the
+	/// lower bound is exclusive; checked on every batch.
 	exclude_beg_key: Option<Key>,
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
@@ -512,11 +656,17 @@ impl UniqueRangeBackwardIterator {
 		})
 	}
 
+	/// Fetch the next batch of record IDs in descending key order.
+	///
+	/// On the first call, if the upper bound is exclusive, keys equal to
+	/// `end` are skipped.  On *every* call, if the lower bound is exclusive,
+	/// keys equal to `beg` are skipped.
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		if self.done {
 			return Ok(Vec::new());
 		}
 
+		// Capture the key to exclude *before* we retreat the cursor.
 		let check_exclusive_end = if self.end_checked {
 			None
 		} else {
@@ -531,6 +681,8 @@ impl UniqueRangeBackwardIterator {
 			return Ok(Vec::new());
 		}
 
+		// Retreat `end` to the last returned key.  The half-open range
+		// `[beg, end)` will then exclude this key on the next batch.
 		if let Some((key, _)) = res.last() {
 			self.end.clone_from(key);
 		}
@@ -539,11 +691,13 @@ impl UniqueRangeBackwardIterator {
 
 		let mut records = Vec::with_capacity(res.len());
 		for (key, val) in res {
+			// Skip the excluded leading-edge key (first batch only).
 			if let Some(ref exclusive_key) = check_exclusive_end
 				&& key == *exclusive_key
 			{
 				continue;
 			}
+			// Skip the excluded trailing-edge key (every batch).
 			if let Some(ref beg_key) = self.exclude_beg_key
 				&& key == *beg_key
 			{
@@ -557,14 +711,18 @@ impl UniqueRangeBackwardIterator {
 	}
 }
 
-/// Enum dispatching range scans on unique indexes to the
-/// appropriate direction-specific iterator.
+/// Direction-dispatching wrapper for range scans on unique indexes.
+///
+/// Delegates to [`UniqueRangeForwardIterator`] or
+/// [`UniqueRangeBackwardIterator`] depending on the [`ScanDirection`]
+/// provided at construction time.
 pub(crate) enum UniqueRangeIterator {
 	Forward(UniqueRangeForwardIterator),
 	Backward(UniqueRangeBackwardIterator),
 }
 
 impl UniqueRangeIterator {
+	/// Create a new unique range iterator for the given direction.
 	pub(crate) fn new(
 		ns: NamespaceId,
 		db: DatabaseId,
@@ -583,6 +741,7 @@ impl UniqueRangeIterator {
 		}
 	}
 
+	/// Fetch the next batch, delegating to the inner iterator.
 	pub(crate) async fn next_batch(&mut self, tx: &Transaction) -> Result<Vec<RecordId>> {
 		match self {
 			Self::Forward(iter) => iter.next_batch(tx).await,
@@ -590,6 +749,10 @@ impl UniqueRangeIterator {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Compound-index iterators
+// ---------------------------------------------------------------------------
 
 /// Iterator for compound (multi-column) index equality scans.
 ///
@@ -676,16 +839,18 @@ impl CompoundEqualIterator {
 	}
 }
 
-/// Iterator for compound (multi-column) index range scans.
+/// Forward iterator for compound (multi-column) index range scans.
 ///
 /// Handles the case where leading columns are fixed by equality and the
-/// next column has a range condition (e.g. `a = 1 AND b > 5`).
+/// next column has a range condition (e.g. `WHERE a = 1 AND b > 5`).
+/// The key boundaries are computed by [`compute_compound_key_range`],
+/// which encodes the equality prefix together with the range value.
 pub(crate) struct CompoundRangeForwardIterator {
-	/// Current scan position (begin key)
+	/// Lower bound of the remaining scan range (advances after each batch).
 	beg: Vec<u8>,
-	/// End key (exclusive)
+	/// Upper bound of the scan range (exclusive, fixed).
 	end: Vec<u8>,
-	/// Whether iteration is complete
+	/// `true` once the scan range is exhausted.
 	done: bool,
 }
 
@@ -706,7 +871,8 @@ impl CompoundRangeForwardIterator {
 		})
 	}
 
-	/// Fetch the next batch of record IDs, capped at `limit`.
+	/// Fetch the next batch of record IDs in ascending key order,
+	/// capped at `limit` entries.
 	pub(crate) async fn next_batch(
 		&mut self,
 		tx: &Transaction,
@@ -724,10 +890,115 @@ impl CompoundRangeForwardIterator {
 			return Ok(Vec::new());
 		}
 
-		// Advance cursor past the last key for the next batch
+		// Advance `beg` past the last returned key for the next batch.
 		if let Some((key, _)) = res.last() {
 			self.beg.clone_from(key);
 			self.beg.push(0x00);
+		}
+
+		decode_record_ids(res)
+	}
+}
+
+/// Direction-dispatching wrapper for compound range scans.
+///
+/// Delegates to [`CompoundRangeForwardIterator`] or
+/// [`CompoundRangeBackwardIterator`] depending on the [`ScanDirection`]
+/// provided at construction time.
+pub(crate) enum CompoundRangeIterator {
+	Forward(CompoundRangeForwardIterator),
+	Backward(CompoundRangeBackwardIterator),
+}
+
+impl CompoundRangeIterator {
+	/// Create a new compound range iterator for the given direction.
+	pub(crate) fn new(
+		ns: NamespaceId,
+		db: DatabaseId,
+		ix: &IndexDefinition,
+		prefix: &[Value],
+		range: &(BinaryOperator, Value),
+		direction: ScanDirection,
+	) -> Result<Self> {
+		match direction {
+			ScanDirection::Forward => {
+				Ok(Self::Forward(CompoundRangeForwardIterator::new(ns, db, ix, prefix, range)?))
+			}
+			ScanDirection::Backward => {
+				Ok(Self::Backward(CompoundRangeBackwardIterator::new(ns, db, ix, prefix, range)?))
+			}
+		}
+	}
+
+	/// Fetch the next batch, delegating to the inner iterator.
+	pub(crate) async fn next_batch(
+		&mut self,
+		tx: &Transaction,
+		limit: u32,
+	) -> Result<Vec<RecordId>> {
+		match self {
+			Self::Forward(iter) => iter.next_batch(tx, limit).await,
+			Self::Backward(iter) => iter.next_batch(tx, limit).await,
+		}
+	}
+}
+
+/// Backward iterator for compound (multi-column) index range scans.
+///
+/// Mirrors [`CompoundRangeForwardIterator`] but scans in descending key
+/// order using `tx.scanr()`.  The `end` cursor retreats after each batch
+/// while `beg` stays fixed, following the same pattern as
+/// [`IndexRangeBackwardIterator`].
+pub(crate) struct CompoundRangeBackwardIterator {
+	/// Lower bound of the scan range (fixed; only `end` moves).
+	beg: Vec<u8>,
+	/// Upper bound of the remaining scan range (retreats after each batch).
+	end: Vec<u8>,
+	/// `true` once the scan range is exhausted.
+	done: bool,
+}
+
+impl CompoundRangeBackwardIterator {
+	/// Create a new backward compound range iterator.
+	pub(crate) fn new(
+		ns: NamespaceId,
+		db: DatabaseId,
+		ix: &IndexDefinition,
+		prefix: &[Value],
+		range: &(BinaryOperator, Value),
+	) -> Result<Self> {
+		let (beg, end) = compute_compound_key_range(ns, db, ix, prefix, Some(range))?;
+		Ok(Self {
+			beg,
+			end,
+			done: false,
+		})
+	}
+
+	/// Fetch the next batch of record IDs in descending key order,
+	/// capped at `limit` entries.
+	pub(crate) async fn next_batch(
+		&mut self,
+		tx: &Transaction,
+		limit: u32,
+	) -> Result<Vec<RecordId>> {
+		if self.done {
+			return Ok(Vec::new());
+		}
+
+		let scan_limit = limit.min(INDEX_BATCH_SIZE);
+		let res = tx.scanr(self.beg.clone()..self.end.clone(), scan_limit, 0, None).await?;
+
+		if res.is_empty() {
+			self.done = true;
+			return Ok(Vec::new());
+		}
+
+		// Retreat `end` to the last returned key.  The half-open range
+		// `[beg, end)` will then exclude this key on the next batch,
+		// preventing duplicates.
+		if let Some((key, _)) = res.last() {
+			self.end.clone_from(key);
 		}
 
 		decode_record_ids(res)
@@ -743,6 +1014,19 @@ impl CompoundRangeForwardIterator {
 /// Builds the appropriate prefix-based key boundaries depending on whether
 /// the scan is a pure equality prefix or has a range condition on the
 /// next column.
+///
+/// For range conditions, the operator determines which `Index::prefix_ids_*`
+/// helper is used:
+///
+/// | Operator | `beg`                  | `end`                       |
+/// |----------|------------------------|-----------------------------|
+/// | `=`      | `prefix_ids_composite_beg(val)` | `prefix_ids_composite_end(val)` |
+/// | `>`      | `prefix_ids_end(val)`  | `prefix_ids_composite_end(prefix)` |
+/// | `>=`     | `prefix_ids_beg(val)`  | `prefix_ids_composite_end(prefix)` |
+/// | `<`      | `prefix_ids_composite_beg(prefix)` | `prefix_ids_beg(val)` |
+/// | `<=`     | `prefix_ids_composite_beg(prefix)` | `prefix_ids_end(val)` |
+///
+/// When no range is present, the scan covers the full composite prefix.
 fn compute_compound_key_range(
 	ns: NamespaceId,
 	db: DatabaseId,
