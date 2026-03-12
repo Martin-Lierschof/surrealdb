@@ -272,10 +272,8 @@ impl<'ctx> Planner<'ctx> {
 		// (equality-pinned) columns in the input.  These columns have a
 		// single value, so any direction trivially satisfies the ordering.
 		let constant_fields = input.constant_output_fields();
-		let required: Vec<SortProperty> = required
-			.into_iter()
-			.skip_while(|prop| constant_fields.iter().any(|cf| *cf == prop.path))
-			.collect();
+		let required: Vec<SortProperty> =
+			required.into_iter().skip_while(|prop| constant_fields.contains(&prop.path)).collect();
 
 		// If all required fields were constant, the ordering is trivially satisfied.
 		if required.is_empty() {
@@ -2321,19 +2319,19 @@ impl<'ctx> Planner<'ctx> {
 		// branch, which is typically far better than scanning every row
 		// in the index. The outer pipeline adds a Sort when the union
 		// does not satisfy ORDER BY.
-		if path.is_full_range_scan() {
-			if let Some(union_path) = analyzer.try_or_union(cond, direction) {
-				return Ok(Some((union_path, direction)));
-			}
-			// NOTE: We intentionally do NOT try try_in_expansion() here.
-			// The full-range scan covers ORDER BY, enabling sort elimination
-			// and early termination with the batch ceiling.  Replacing it
-			// with a Union of prefix scans would require an expensive Sort
-			// of ALL matching records, which is far worse for ORDER BY +
-			// LIMIT queries.  IN expansion is only helpful in the
-			// candidates.is_empty() fallback above when no index covers
-			// ORDER BY at all.
+		if path.is_full_range_scan()
+			&& let Some(union_path) = analyzer.try_or_union(cond, direction)
+		{
+			return Ok(Some((union_path, direction)));
 		}
+		// NOTE: We intentionally do NOT try try_in_expansion() here.
+		// The full-range scan covers ORDER BY, enabling sort elimination
+		// and early termination with the batch ceiling.  Replacing it
+		// with a Union of prefix scans would require an expensive Sort
+		// of ALL matching records, which is far worse for ORDER BY +
+		// LIMIT queries.  IN expansion is only helpful in the
+		// candidates.is_empty() fallback above when no index covers
+		// ORDER BY at all.
 
 		Ok(Some((path, direction)))
 	}
@@ -2401,11 +2399,11 @@ fn adjust_direction_for_order(
 	// Skip leading ORDER BY fields that match equality-pinned columns.
 	let mut order_idx = 0;
 	for field in order_list.0.iter() {
-		if let Ok(fp) = FieldPath::try_from(&field.value) {
-			if equality_col_paths.iter().any(|ep| *ep == fp) {
-				order_idx += 1;
-				continue;
-			}
+		if let Ok(fp) = FieldPath::try_from(&field.value)
+			&& equality_col_paths.contains(&fp)
+		{
+			order_idx += 1;
+			continue;
 		}
 		break;
 	}

@@ -20,6 +20,31 @@ async fn query_row_count(
 	})
 }
 
+/// Helper: execute a SELECT count() ... GROUP ALL and return the scalar count.
+async fn query_count_value(
+	ds: &surrealdb_core::kvs::Datastore,
+	sess: &Session,
+	sql: &str,
+) -> Result<i64> {
+	let mut res = ds.execute(sql, sess, None).await?;
+	let val = res.remove(0).result?;
+	let Value::Array(arr) = val else {
+		anyhow::bail!("Expected array result for count query")
+	};
+	let row = arr.first().ok_or_else(|| anyhow::anyhow!("Expected one row for count query"))?;
+	let Value::Object(obj) = row else {
+		anyhow::bail!("Expected object row for count query")
+	};
+	let count_val = obj
+		.get("count")
+		.or_else(|| obj.get("c"))
+		.ok_or_else(|| anyhow::anyhow!("Expected count field in count query result"))?;
+	match count_val {
+		Value::Number(n) => Ok(n.to_int()),
+		_ => anyhow::bail!("Expected numeric count value"),
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Issue 1 – LIMIT pushdown with expression-valued WHERE bounds
 //
@@ -372,5 +397,114 @@ async fn select_where_in_compound_index_order_by_limit() -> Result<()> {
 
 	assert_eq!(asc, 15, "IN + compound index + ASC LIMIT 15");
 	assert_eq!(desc, 15, "IN + compound index + DESC LIMIT 15");
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn select_where_in_order_by_id_limit() -> Result<()> {
+	let ds = new_ds("test", "test").await?;
+	let sess = Session::owner().with_ns("test").with_db("test");
+
+	ds.execute("DEFINE INDEX idx_status ON item FIELDS status", &sess, None).await?;
+
+	let mut sql = String::new();
+	for i in 1..=90 {
+		let status = match i % 3 {
+			1 => "active",
+			2 => "pending",
+			_ => "archived",
+		};
+		sql.push_str(&format!("CREATE item:{i} SET status = '{status}';\n"));
+	}
+	ds.execute(&sql, &sess, None).await?;
+
+	let asc = query_row_count(
+		&ds,
+		&sess,
+		"SELECT id FROM item
+		 WHERE status IN ['active', 'pending']
+		 ORDER BY id ASC LIMIT 12",
+	)
+	.await?;
+	let desc = query_row_count(
+		&ds,
+		&sess,
+		"SELECT id FROM item
+		 WHERE status IN ['active', 'pending']
+		 ORDER BY id DESC LIMIT 12",
+	)
+	.await?;
+
+	assert_eq!(asc, 12, "WHERE IN + ORDER BY id ASC LIMIT 12 should return 12 rows");
+	assert_eq!(desc, 12, "WHERE IN + ORDER BY id DESC LIMIT 12 should return 12 rows");
+	Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn select_count_where_btree_paths() -> Result<()> {
+	let ds = new_ds("test", "test").await?;
+	let sess = Session::owner().with_ns("test").with_db("test");
+
+	ds.execute(
+		"DEFINE INDEX idx_score ON item FIELDS score;
+		 DEFINE INDEX idx_unique ON item FIELDS uid UNIQUE;
+		 DEFINE INDEX idx_status_score ON item FIELDS status, score;",
+		&sess,
+		None,
+	)
+	.await?;
+
+	let mut sql = String::new();
+	for i in 1..=120 {
+		let status = if i % 2 == 0 {
+			"active"
+		} else {
+			"pending"
+		};
+		sql.push_str(&format!(
+			"CREATE item:{i} SET uid = {i}, status = '{status}', score = {};\n",
+			i % 30
+		));
+	}
+	ds.execute(&sql, &sess, None).await?;
+
+	let unique_eq = query_count_value(
+		&ds,
+		&sess,
+		"SELECT count() AS c FROM item WHERE uid = 42 GROUP ALL",
+	)
+	.await?;
+	let non_unique_eq = query_count_value(
+		&ds,
+		&sess,
+		"SELECT count() AS c FROM item WHERE score = 7 GROUP ALL",
+	)
+	.await?;
+	let non_unique_range = query_count_value(
+		&ds,
+		&sess,
+		"SELECT count() AS c FROM item WHERE score > 10 AND score < 20 GROUP ALL",
+	)
+	.await?;
+	let compound_eq = query_count_value(
+		&ds,
+		&sess,
+		"SELECT count() AS c FROM item WITH INDEX idx_status_score
+		 WHERE status = 'active' AND score = 8 GROUP ALL",
+	)
+	.await?;
+	let compound_range = query_count_value(
+		&ds,
+		&sess,
+		"SELECT count() AS c FROM item WITH INDEX idx_status_score
+		 WHERE status = 'active' AND score > 5 AND score < 15 GROUP ALL",
+	)
+	.await?;
+
+	assert_eq!(unique_eq, 1, "Unique equality count should return 1");
+	assert_eq!(non_unique_eq, 4, "score=7 appears 4 times in 1..=120 with modulo 30");
+	assert_eq!(non_unique_range, 36, "scores 11..19 each appear 4 times");
+	assert_eq!(compound_eq, 4, "active+score=8 appears 4 times");
+	assert_eq!(compound_range, 20, "active rows for scores 6,8,10,12,14");
 	Ok(())
 }

@@ -352,7 +352,7 @@ impl ExecOperator for IndexScan {
 			let batch_max: u32 = match &ceiling_expr {
 				Some(expr) => {
 					let c = eval_limit_expr(&**expr, &ctx).await?;
-					c.saturating_add(start_val).saturating_mul(4).max(1).min(1000) as u32
+					c.saturating_add(start_val).saturating_mul(4).clamp(1, 1000) as u32
 				}
 				None => u32::MAX, // next_batch caps at INDEX_BATCH_SIZE internally
 			};

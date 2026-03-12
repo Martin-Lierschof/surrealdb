@@ -141,8 +141,8 @@ impl MutVisitor for ExpressionFolder<'_> {
 ///
 /// Handles:
 /// - `time::now()` → `Literal::Datetime(now)` (special case: non-pure but per-statement)
-/// - Pure function calls where all arguments are already literals
-///   (math::floor, string::lowercase, type::int, etc.)
+/// - Pure function calls where all arguments are already literals (math::floor, string::lowercase,
+///   type::int, etc.)
 /// - Binary arithmetic on two literals (datetime ± duration, number ± number, etc.)
 fn try_fold_to_literal(expr: &Expr, registry: &FunctionRegistry) -> Option<Expr> {
 	use crate::expr::Function;
@@ -1241,10 +1241,8 @@ pub(super) fn index_covers_ordering(
 	// Strip leading ORDER BY fields that reference equality-pinned columns.
 	// These columns have a single constant value, so any direction trivially
 	// satisfies the ordering requirement for them.
-	let required: Vec<SortProperty> = required
-		.into_iter()
-		.skip_while(|prop| equality_field_paths.iter().any(|ef| *ef == prop.path))
-		.collect();
+	let required: Vec<SortProperty> =
+		required.into_iter().skip_while(|prop| equality_field_paths.contains(&prop.path)).collect();
 
 	// Build the index ordering (same as IndexScan::output_ordering())
 	let dir = match direction {

@@ -194,7 +194,7 @@ impl<'a> IndexAnalyzer<'a> {
 					&& idiom_matches(idiom, first_col)
 				{
 					let ncols = ix_def.cols.len();
-					if best.map_or(true, |(_, best_ncols)| ncols < best_ncols) {
+					if best.is_none_or(|(_, best_ncols)| ncols < best_ncols) {
 						best = Some((idx, ncols));
 					}
 				}
