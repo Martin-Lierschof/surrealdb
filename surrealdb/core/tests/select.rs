@@ -40,7 +40,9 @@ async fn query_count_value(
 		.or_else(|| obj.get("c"))
 		.ok_or_else(|| anyhow::anyhow!("Expected count field in count query result"))?;
 	match count_val {
-		Value::Number(n) => Ok(n.to_int()),
+		Value::Number(n) => {
+			n.to_int().ok_or_else(|| anyhow::anyhow!("Expected count value convertible to i64"))
+		}
 		_ => anyhow::bail!("Expected numeric count value"),
 	}
 }
@@ -468,18 +470,12 @@ async fn select_count_where_btree_paths() -> Result<()> {
 	}
 	ds.execute(&sql, &sess, None).await?;
 
-	let unique_eq = query_count_value(
-		&ds,
-		&sess,
-		"SELECT count() AS c FROM item WHERE uid = 42 GROUP ALL",
-	)
-	.await?;
-	let non_unique_eq = query_count_value(
-		&ds,
-		&sess,
-		"SELECT count() AS c FROM item WHERE score = 7 GROUP ALL",
-	)
-	.await?;
+	let unique_eq =
+		query_count_value(&ds, &sess, "SELECT count() AS c FROM item WHERE uid = 42 GROUP ALL")
+			.await?;
+	let non_unique_eq =
+		query_count_value(&ds, &sess, "SELECT count() AS c FROM item WHERE score = 7 GROUP ALL")
+			.await?;
 	let non_unique_range = query_count_value(
 		&ds,
 		&sess,
